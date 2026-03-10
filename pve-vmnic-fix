@@ -1,0 +1,240 @@
+#!/bin/bash
+set -euo pipefail
+
+# pve-vmnic-fix - Repair VM/CT network bridges in Proxmox VE
+#
+# When the host network stack is reconfigured (e.g. after applying pending
+# network changes, restarting networking, or an SDN reload), the virtual
+# bridges that connect VM/CT NICs to the physical network can be left in a
+# broken state.  Symptoms include tap/veth interfaces losing their bridge
+# master, firewall intermediary links going DOWN, or EVPN not learning the
+# guest MAC.
+#
+# This script detects the guest type (VM or CT), walks every configured NIC,
+# and repairs the plumbing:
+#   - Brings all link-pair interfaces UP
+#   - Re-attaches them to the correct bridge if the master was lost
+#   - Bounces the firewall bridge to clear LOWERLAYERDOWN
+#   - Deletes and re-adds the guest MAC in the FDB so EVPN re-announces it
+#
+# Supports both firewall-enabled NICs (fwbr/fwpr/fwln chain) and direct
+# tap/veth connections.
+
+VERSION="1.1.0"
+
+# --- Colors (disabled when stdout is not a terminal) --------------------------
+if [[ -t 1 ]]; then
+    C_RED='\033[0;31m'
+    C_GREEN='\033[0;32m'
+    C_YELLOW='\033[0;33m'
+    C_CYAN='\033[0;36m'
+    C_BOLD='\033[1m'
+    C_RESET='\033[0m'
+else
+    C_RED='' C_GREEN='' C_YELLOW='' C_CYAN='' C_BOLD='' C_RESET=''
+fi
+
+# --- Helpers ------------------------------------------------------------------
+msg()  { echo -e "${C_BOLD}${C_CYAN}::${C_RESET} $*"; }
+ok()   { echo -e "   ${C_GREEN}[+]${C_RESET} $*"; }
+warn() { echo -e "   ${C_YELLOW}[!]${C_RESET} $*"; }
+err()  { echo -e "   ${C_RED}[-]${C_RESET} $*" >&2; }
+
+DRY_RUN=0
+ERRORS=0
+
+run() {
+    if (( DRY_RUN )); then
+        echo -e "   ${C_YELLOW}[dry-run]${C_RESET} $*"
+    else
+        "$@"
+    fi
+}
+
+# --- Usage / Help -------------------------------------------------------------
+usage() {
+    cat <<EOF
+Usage: $(basename "$0") [OPTIONS] <VMID|CTID|--all>
+
+Repair VM/CT network bridges after host network changes.
+
+Arguments:
+  <VMID|CTID>       Numeric ID of a single VM or container to fix.
+  --all, -a         Fix all running VMs and containers.
+
+Options:
+  --dry-run, -n     Show what would be done without making changes.
+  --help, -h        Show this help message.
+  --version, -v     Show version.
+
+Examples:
+  $(basename "$0") 100            Fix a single guest
+  $(basename "$0") --all          Fix every running guest
+  $(basename "$0") -n --all       Dry-run for all guests
+EOF
+}
+
+# --- Core: fix one guest ------------------------------------------------------
+fix_guest() {
+    local ID="$1"
+
+    # Determine type
+    local TYPE CONFIG IF_PREFIX
+    if qm status "$ID" >/dev/null 2>&1; then
+        TYPE="vm"
+        CONFIG=$(qm config "$ID")
+        IF_PREFIX="tap"
+    elif pct status "$ID" >/dev/null 2>&1; then
+        TYPE="ct"
+        CONFIG=$(pct config "$ID")
+        IF_PREFIX="veth"
+    else
+        err "ID $ID not found as a VM or CT."
+        (( ERRORS++ ))
+        return 1
+    fi
+
+    msg "Fixing $TYPE $ID"
+
+    # Extract net lines
+    local NET_CONFIGS
+    NET_CONFIGS=$(echo "$CONFIG" | grep -E '^net[0-9]+' || true)
+
+    if [[ -z "$NET_CONFIGS" ]]; then
+        warn "No network interfaces configured for $ID."
+        return 0
+    fi
+
+    while IFS= read -r line; do
+        local IDX BRIDGE
+        IDX=$(echo "$line" | cut -d':' -f1 | sed 's/net//')
+        BRIDGE=$(echo "$line" | sed -e 's/.*bridge=\([^,]*\).*/\1/')
+
+        echo -e "   Checking ${C_BOLD}net${IDX}${C_RESET} (bridge: ${BRIDGE})..."
+
+        # Interface names
+        local TAP_IF="${IF_PREFIX}${ID}i${IDX}"
+        local FWPR="fwpr${ID}p${IDX}"
+        local FWLN="fwln${ID}i${IDX}"
+        local FWBR="fwbr${ID}i${IDX}"
+
+        local TARGET_IF=""
+
+        # CASE A: Firewall ENABLED (intermediary bridges)
+        if ip link show "$FWPR" >/dev/null 2>&1; then
+            echo -e "   ${C_CYAN}[Firewall: ON]${C_RESET} Repairing link pair..."
+            run ip link set "$FWPR" up
+            run ip link set "$FWLN" up
+            run ip link set "$FWBR" up 2>/dev/null || true
+
+            local CURRENT_MASTER
+            CURRENT_MASTER=$(bridge link show dev "$FWPR" 2>/dev/null | awk '{print $3}')
+            if [[ "$CURRENT_MASTER" != "$BRIDGE" ]]; then
+                run ip link set "$FWPR" master "$BRIDGE"
+                ok "Plugged $FWPR into $BRIDGE"
+            fi
+
+            # Bounce the firewall bridge to clear LOWERLAYERDOWN
+            if (( ! DRY_RUN )); then
+                ip link set "$FWBR" down && sleep 0.1 && ip link set "$FWBR" up
+            else
+                echo -e "   ${C_YELLOW}[dry-run]${C_RESET} bounce $FWBR (down/up)"
+            fi
+            TARGET_IF="$FWPR"
+
+        # CASE B: Firewall DISABLED (direct connection)
+        elif ip link show "$TAP_IF" >/dev/null 2>&1; then
+            echo -e "   ${C_CYAN}[Firewall: OFF]${C_RESET} Repairing direct tap..."
+            run ip link set "$TAP_IF" up
+
+            local CURRENT_MASTER
+            CURRENT_MASTER=$(bridge link show dev "$TAP_IF" 2>/dev/null | awk '{print $3}')
+            if [[ "$CURRENT_MASTER" != "$BRIDGE" ]]; then
+                run ip link set "$TAP_IF" master "$BRIDGE"
+                ok "Plugged $TAP_IF into $BRIDGE"
+            fi
+            TARGET_IF="$TAP_IF"
+        else
+            warn "No interface found for net${IDX}. Guest may not be running."
+            continue
+        fi
+
+        # EVPN MAC re-learn
+        local VM_MAC
+        VM_MAC=$(bridge fdb show dev "$TARGET_IF" 2>/dev/null | grep -v "self" | head -n 1 | awk '{print $1}')
+        if [[ -n "$VM_MAC" ]]; then
+            run bridge fdb del "$VM_MAC" dev "$TARGET_IF" master 2>/dev/null || true
+            run bridge fdb add "$VM_MAC" dev "$TARGET_IF" master static 2>/dev/null || true
+            ok "EVPN MAC $VM_MAC re-announced."
+        fi
+
+    done <<< "$NET_CONFIGS"
+}
+
+# --- Collect all running guest IDs --------------------------------------------
+all_running_ids() {
+    local ids=()
+    # Running VMs (QEMU)
+    while IFS= read -r vmid; do
+        [[ -n "$vmid" ]] && ids+=("$vmid")
+    done < <(qm list 2>/dev/null | awk 'NR>1 && $3=="running" {print $1}')
+    # Running CTs (LXC)
+    while IFS= read -r ctid; do
+        [[ -n "$ctid" ]] && ids+=("$ctid")
+    done < <(pct list 2>/dev/null | awk 'NR>1 && $2=="running" {print $1}')
+    echo "${ids[@]}"
+}
+
+# --- Main ---------------------------------------------------------------------
+main() {
+    local ALL=0
+    local IDS=()
+
+    # Parse arguments
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --help|-h)    usage; exit 0 ;;
+            --version|-v) echo "pve-vmnic-fix $VERSION"; exit 0 ;;
+            --dry-run|-n) DRY_RUN=1; shift ;;
+            --all|-a)     ALL=1; shift ;;
+            -*)           err "Unknown option: $1"; usage; exit 1 ;;
+            *)            IDS+=("$1"); shift ;;
+        esac
+    done
+
+    if (( ALL )); then
+        IDS=( $(all_running_ids) )
+        if [[ ${#IDS[@]} -eq 0 ]]; then
+            echo "No running VMs or CTs found."
+            exit 0
+        fi
+    fi
+
+    if [[ ${#IDS[@]} -eq 0 ]]; then
+        err "No VMID/CTID specified."
+        usage
+        exit 1
+    fi
+
+    # Root check
+    if [[ $EUID -ne 0 ]]; then
+        err "This script must be run as root."
+        exit 1
+    fi
+
+    (( DRY_RUN )) && echo -e "${C_YELLOW}=== DRY RUN MODE ===${C_RESET}\n"
+
+    for id in "${IDS[@]}"; do
+        fix_guest "$id" || true
+    done
+
+    echo ""
+    if (( ERRORS )); then
+        err "$ERRORS guest(s) had errors."
+        exit 1
+    else
+        msg "Done. All guests processed successfully."
+    fi
+}
+
+main "$@"
