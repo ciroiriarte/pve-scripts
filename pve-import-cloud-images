@@ -63,6 +63,15 @@ CUSTOMIZE=1
 MODE=""
 DISTRO_FILTER=""
 MAX_VERSIONS=2
+ARCH="x86_64"
+TIMESTAMP=$(date +%Y%m%d)
+
+# --- API mode -----------------------------------------------------------------
+API_MODE=0
+API_HOST=""
+API_NODE=""
+API_TOKEN=""
+API_IMPORT_STORAGE="local"
 
 # --- Image catalog (populated dynamically by mirror discovery) ----------------
 declare -a IMG_KEY=() IMG_NAME=() IMG_URL=() IMG_FAMILY=() IMG_CUSTOMIZE=()
@@ -188,17 +197,35 @@ discover_opensuse() {
     local found=0
     for ver in $versions; do
         (( found >= MAX_VERSIONS )) && break
-        local listing filename=""
-        listing=$(fetch_page "$base/$ver/appliances/") || continue
-        # Cloud variant (cloud-init support); naming differs between 15.x and 16.x
-        for pattern in \
-            "openSUSE-Leap-${ver}-Minimal-VM.x86_64-Cloud.qcow2" \
-            "Leap-${ver}-Minimal-VM.x86_64-Cloud.qcow2"; do
-            filename=$(echo "$listing" | extract_hrefs | grep -F "$pattern" | head -1)
-            [[ -n "$filename" ]] && break
-        done
-        [[ -n "$filename" ]] || continue
-        echo "opensuse-${ver}|openSUSE Leap ${ver}|${base}/${ver}/appliances/${filename}|opensuse|ptp-fix"
+        local url=""
+
+        # Prefer NoCloud variant from Cloud:Images repo (designed for local
+        # cloud-init datasources like PVE's config drive).
+        local ci_base="https://download.opensuse.org/repositories/Cloud:/Images:/Leap_${ver}/images"
+        local ci_listing
+        ci_listing=$(fetch_page "$ci_base/") 2>/dev/null || true
+        if [[ -n "$ci_listing" ]]; then
+            local ci_filename
+            ci_filename=$(echo "$ci_listing" | extract_hrefs \
+                | grep -F "x86_64-NoCloud.qcow2" | grep -v '\.sha256' | head -1)
+            [[ -n "$ci_filename" ]] && url="${ci_base}/${ci_filename}"
+        fi
+
+        # Fall back to Cloud variant from distribution/leap appliances
+        if [[ -z "$url" ]]; then
+            local listing filename=""
+            listing=$(fetch_page "$base/$ver/appliances/") || continue
+            for pattern in \
+                "openSUSE-Leap-${ver}-Minimal-VM.x86_64-Cloud.qcow2" \
+                "Leap-${ver}-Minimal-VM.x86_64-Cloud.qcow2"; do
+                filename=$(echo "$listing" | extract_hrefs | grep -F "$pattern" | head -1)
+                [[ -n "$filename" ]] && break
+            done
+            [[ -n "$filename" ]] || continue
+            url="${base}/${ver}/appliances/${filename}"
+        fi
+
+        echo "opensuse-${ver}|openSUSE Leap ${ver}|${url}|opensuse|ptp-fix"
         (( found++ )) || true
     done
 }
@@ -299,6 +326,13 @@ check_fetch_deps() {
 }
 
 check_import_deps() {
+    if (( API_MODE )); then
+        if ! command -v curl &>/dev/null; then
+            err "curl is required for API mode."
+            exit 1
+        fi
+        return
+    fi
     local missing=()
     for cmd in qm qemu-img; do
         command -v "$cmd" &>/dev/null || missing+=("$cmd")
@@ -318,7 +352,62 @@ check_import_deps() {
 
 # --- VMID helpers -------------------------------------------------------------
 vmid_exists() {
-    qm status "$1" &>/dev/null 2>&1 || pct status "$1" &>/dev/null 2>&1
+    if (( API_MODE )); then
+        pve_api GET "nodes/${API_NODE}/qemu/$1/status/current" &>/dev/null \
+            || pve_api GET "nodes/${API_NODE}/lxc/$1/status/current" &>/dev/null
+    else
+        qm status "$1" &>/dev/null 2>&1 || pct status "$1" &>/dev/null 2>&1
+    fi
+}
+
+# --- PVE REST API helpers -----------------------------------------------------
+pve_api() {
+    local method="$1" endpoint="$2"
+    shift 2
+    local -a curl_args=(-sfk --max-time 30
+        -H "Authorization: PVEAPIToken=${API_TOKEN}")
+
+    [[ "$method" != "GET" ]] && curl_args+=(-X "$method")
+
+    for arg in "$@"; do
+        curl_args+=(--data-urlencode "$arg")
+    done
+
+    curl "${curl_args[@]}" "${API_HOST}/api2/json/${endpoint}"
+}
+
+pve_extract_upid() {
+    grep -o '"data":"UPID:[^"]*"' | head -1 | sed 's/"data":"//;s/"$//'
+}
+
+pve_wait_task() {
+    local upid="$1" timeout="${2:-120}"
+    local elapsed=0
+
+    while (( elapsed < timeout )); do
+        local response status exitstatus
+        response=$(pve_api GET "nodes/${API_NODE}/tasks/${upid}/status") || {
+            sleep 3; (( elapsed += 3 )); continue
+        }
+
+        status=$(echo "$response" | grep -o '"status":"[^"]*"' | head -1 | cut -d'"' -f4)
+
+        if [[ "$status" == "stopped" ]]; then
+            exitstatus=$(echo "$response" | grep -o '"exitstatus":"[^"]*"' | head -1 | cut -d'"' -f4)
+            if [[ "$exitstatus" == "OK" ]]; then
+                return 0
+            else
+                err "Task failed: ${exitstatus:-unknown}"
+                return 1
+            fi
+        fi
+
+        sleep 3
+        (( elapsed += 3 ))
+    done
+
+    err "Task timed out after ${timeout}s: ${upid}"
+    return 1
 }
 
 # --- Download -----------------------------------------------------------------
@@ -354,7 +443,16 @@ customize_image() {
     case "$action" in
         guest-agent)
             msg "Injecting qemu-guest-agent..."
-            run virt-customize -a "$image" --install qemu-guest-agent
+            # libguestfs SLIRP networking uses 169.254.0.0/16 (not the
+            # traditional 10.0.2.0/24).  The appliance does not bring up
+            # the interface automatically, so we configure it manually.
+            # Everything must run in a single --run-command because the
+            # network state set via ip(8) does not persist across
+            # separate virt-customize operations.
+            # /etc/resolv.conf may be a dangling symlink (systemd-resolved),
+            # so we force-create it via run-command and clean up afterwards.
+            run virt-customize --network -a "$image" \
+                --run-command 'ip link set eth0 up; ip addr add 169.254.2.15/16 dev eth0; ip route add default via 169.254.2.2; rm -f /etc/resolv.conf; echo nameserver 169.254.2.3 > /etc/resolv.conf; export DEBIAN_FRONTEND=noninteractive; apt-get -q update && apt-get -q -y install qemu-guest-agent || yum -y install qemu-guest-agent || zypper -n install qemu-guest-agent || true; rm -f /etc/resolv.conf'
             ;;
         ptp-fix)
             msg "Enabling ptp_kvm module..."
@@ -364,15 +462,17 @@ customize_image() {
     esac
 }
 
-# --- Import a single image as template ----------------------------------------
-import_single() {
+# --- Import a single image as template (local mode) ---------------------------
+import_single_local() {
     local idx="$1"
     local key="${IMG_KEY[$idx]}"
     local name="${IMG_NAME[$idx]}"
     local url="${IMG_URL[$idx]}"
     local customize="${IMG_CUSTOMIZE[$idx]}"
     local vmid=$(( START_ID + idx + 1 ))
-    local tpl_name="cloud-${key}"
+    # PVE VM names must be valid DNS hostnames (no underscores)
+    local safe_arch="${ARCH//_/-}"
+    local tpl_name="ci-${key}-${TIMESTAMP}.${safe_arch}"
     local filename work_image
     filename=$(basename "$url")
 
@@ -459,11 +559,13 @@ import_single() {
         }
         echo "$import_out" | tail -1
 
-        # Parse volume reference from:
-        #   Successfully imported disk as 'unused0:STORAGE:vm-VMID-disk-N'
+        # Parse volume reference from import output.  Supported formats:
+        #   PVE 8.x: Successfully imported disk as 'unused0:STORAGE:vm-VMID-disk-N'
+        #   PVE 9.x: unused0: successfully imported disk 'STORAGE:VMID/vm-VMID-disk-N.fmt'
         local disk_ref
         disk_ref=$(echo "$import_out" \
-                   | sed -n "s/.*'unused[0-9]*:\(.*\)'.*/\1/p" | tail -1)
+                   | sed -n "s/.*'unused[0-9]*:\(.*\)'.*/\1/p; s/.*imported disk '\([^']*\)'.*/\1/p" \
+                   | tail -1)
         if [[ -z "$disk_ref" ]]; then
             err "Could not parse imported disk reference"
             qm destroy "$vmid" --purge 2>/dev/null || true
@@ -491,17 +593,228 @@ import_single() {
     ok "Template ${C_BOLD}${tpl_name}${C_RESET} (VMID ${vmid}) ready"
 }
 
+# --- Import a single image as template (API mode) ----------------------------
+import_single_api() {
+    local idx="$1"
+    local key="${IMG_KEY[$idx]}"
+    local name="${IMG_NAME[$idx]}"
+    local url="${IMG_URL[$idx]}"
+    local customize="${IMG_CUSTOMIZE[$idx]}"
+    local vmid=$(( START_ID + idx + 1 ))
+    # PVE VM names must be valid DNS hostnames (no underscores)
+    local safe_arch="${ARCH//_/-}"
+    local tpl_name="ci-${key}-${TIMESTAMP}.${safe_arch}"
+    local filename
+    filename=$(basename "$url")
+
+    msg "Importing ${C_BOLD}${name}${C_RESET} → ${tpl_name} (VMID ${vmid}) [API mode]"
+
+    # Skip xz-compressed images (e.g. FreeBSD) in API mode
+    if [[ "$filename" == *.xz ]]; then
+        warn "Skipping ${name}: .xz compressed images not supported in API mode"
+        warn "Use local mode (without --api) for this image"
+        return 0
+    fi
+
+    # Warn about skipped customization
+    if [[ -n "$customize" ]]; then
+        warn "Customization '${customize}' skipped in API mode (use cloud-init instead)"
+    fi
+
+    # Check for collision
+    if vmid_exists "$vmid"; then
+        if (( FORCE )); then
+            warn "VMID ${vmid} exists — destroying (--force)"
+            if (( DRY_RUN )); then
+                echo -e "   ${C_YELLOW}[dry-run]${C_RESET} DELETE nodes/${API_NODE}/qemu/${vmid}?purge=1"
+            else
+                local response upid
+                response=$(pve_api DELETE \
+                    "nodes/${API_NODE}/qemu/${vmid}?purge=1&destroy-unreferenced-disks=1") || true
+                upid=$(echo "$response" | pve_extract_upid)
+                [[ -z "$upid" ]] || pve_wait_task "$upid" 60
+            fi
+        else
+            warn "VMID ${vmid} exists — skipping (use --force to replace)"
+            return 0
+        fi
+    fi
+
+    # Download image to PVE import storage
+    if (( DRY_RUN )); then
+        echo -e "   ${C_YELLOW}[dry-run]${C_RESET} POST nodes/${API_NODE}/storage/${API_IMPORT_STORAGE}/download-url"
+        echo -e "   ${C_YELLOW}[dry-run]${C_RESET}   url=${url}"
+        echo -e "   ${C_YELLOW}[dry-run]${C_RESET}   filename=${filename}, content=import"
+    else
+        # Check if image is already on the import storage
+        if pve_api GET \
+            "nodes/${API_NODE}/storage/${API_IMPORT_STORAGE}/content/${API_IMPORT_STORAGE}:import/${filename}" \
+            &>/dev/null; then
+            ok "Image already on PVE: ${filename}"
+        else
+            msg "Downloading ${filename} via PVE..."
+            local response upid
+            response=$(pve_api POST \
+                "nodes/${API_NODE}/storage/${API_IMPORT_STORAGE}/download-url" \
+                "url=${url}" "content=import" "filename=${filename}") || {
+                err "Failed to initiate download for ${name}"
+                return 1
+            }
+            upid=$(echo "$response" | pve_extract_upid)
+            if [[ -z "$upid" ]]; then
+                err "No task ID returned for download"
+                return 1
+            fi
+            ok "Download task: ${upid}"
+            pve_wait_task "$upid" 600 || {
+                err "Download failed for ${name}"
+                return 1
+            }
+            ok "Download complete"
+        fi
+    fi
+
+    # Create VM shell (no disks — added in subsequent steps)
+    local ostype="l26"
+    [[ "${IMG_FAMILY[$idx]}" == "freebsd" ]] && ostype="other"
+
+    msg "Creating VM ${vmid}..."
+    if (( DRY_RUN )); then
+        echo -e "   ${C_YELLOW}[dry-run]${C_RESET} POST nodes/${API_NODE}/qemu"
+        echo -e "   ${C_YELLOW}[dry-run]${C_RESET}   vmid=${vmid} name=${tpl_name} cores=2 memory=2048"
+    else
+        local response upid
+        response=$(pve_api POST "nodes/${API_NODE}/qemu" \
+            "vmid=${vmid}" "name=${tpl_name}" \
+            "cores=2" "memory=2048" \
+            "net0=virtio,firewall=1,bridge=${BRIDGE}" \
+            "scsihw=virtio-scsi-pci" \
+            "bios=ovmf" "machine=q35" \
+            "agent=enabled=1" "ostype=${ostype}" \
+            "cpu=cputype=max" \
+            "serial0=socket" "vga=serial0") || {
+            err "Failed to create VM ${vmid}"
+            return 1
+        }
+        upid=$(echo "$response" | pve_extract_upid)
+        if [[ -n "$upid" ]]; then
+            pve_wait_task "$upid" 60 || {
+                err "VM creation failed for ${name}"
+                return 1
+            }
+        fi
+        ok "VM ${vmid} created"
+    fi
+
+    # Import disk via import-from
+    local import_vol="${API_IMPORT_STORAGE}:import/${filename}"
+    local scsi0_spec="${STORAGE}:0,import-from=${import_vol},format=${DISK_FORMAT},discard=on,ssd=1"
+
+    msg "Importing disk → ${STORAGE} (format: ${DISK_FORMAT})"
+    if (( DRY_RUN )); then
+        echo -e "   ${C_YELLOW}[dry-run]${C_RESET} PUT nodes/${API_NODE}/qemu/${vmid}/config"
+        echo -e "   ${C_YELLOW}[dry-run]${C_RESET}   scsi0=${scsi0_spec}"
+    else
+        local response upid
+        response=$(pve_api PUT "nodes/${API_NODE}/qemu/${vmid}/config" \
+            "scsi0=${scsi0_spec}") || {
+            err "Disk import failed for ${name}"
+            pve_api DELETE "nodes/${API_NODE}/qemu/${vmid}?purge=1" &>/dev/null || true
+            return 1
+        }
+        upid=$(echo "$response" | pve_extract_upid)
+        if [[ -n "$upid" ]]; then
+            pve_wait_task "$upid" 300 || {
+                err "Disk import failed for ${name}"
+                pve_api DELETE "nodes/${API_NODE}/qemu/${vmid}?purge=1" &>/dev/null || true
+                return 1
+            }
+        fi
+        ok "Disk imported"
+    fi
+
+    # EFI disk (OVMF)
+    if (( DRY_RUN )); then
+        echo -e "   ${C_YELLOW}[dry-run]${C_RESET} PUT nodes/${API_NODE}/qemu/${vmid}/config efidisk0=${STORAGE}:0,efitype=4m"
+    else
+        local response upid
+        response=$(pve_api PUT "nodes/${API_NODE}/qemu/${vmid}/config" \
+            "efidisk0=${STORAGE}:0,efitype=4m") || {
+            err "EFI disk creation failed"; return 1
+        }
+        upid=$(echo "$response" | pve_extract_upid)
+        [[ -z "$upid" ]] || pve_wait_task "$upid" 60 || { err "EFI disk creation failed"; return 1; }
+    fi
+
+    # Cloud-init drive (on IDE to avoid SCSI bus numbering issues)
+    if (( DRY_RUN )); then
+        echo -e "   ${C_YELLOW}[dry-run]${C_RESET} PUT nodes/${API_NODE}/qemu/${vmid}/config ide2=${STORAGE}:cloudinit"
+    else
+        local response upid
+        response=$(pve_api PUT "nodes/${API_NODE}/qemu/${vmid}/config" \
+            "ide2=${STORAGE}:cloudinit") || {
+            err "Cloud-init drive creation failed"; return 1
+        }
+        upid=$(echo "$response" | pve_extract_upid)
+        [[ -z "$upid" ]] || pve_wait_task "$upid" 60 || { err "Cloud-init drive creation failed"; return 1; }
+    fi
+
+    # Boot order
+    if (( DRY_RUN )); then
+        echo -e "   ${C_YELLOW}[dry-run]${C_RESET} PUT nodes/${API_NODE}/qemu/${vmid}/config boot=order=scsi0"
+    else
+        pve_api PUT "nodes/${API_NODE}/qemu/${vmid}/config" \
+            "boot=order=scsi0" &>/dev/null || true
+    fi
+
+    # Resize boot disk (optional)
+    if [[ -n "$DISK_SIZE" ]]; then
+        msg "Resizing disk → ${DISK_SIZE}"
+        if (( DRY_RUN )); then
+            echo -e "   ${C_YELLOW}[dry-run]${C_RESET} PUT nodes/${API_NODE}/qemu/${vmid}/resize disk=scsi0 size=${DISK_SIZE}"
+        else
+            pve_api PUT "nodes/${API_NODE}/qemu/${vmid}/resize" \
+                "disk=scsi0" "size=${DISK_SIZE}" &>/dev/null || {
+                warn "Disk resize failed (template may have smaller disk)"
+            }
+        fi
+    fi
+
+    # Seal as template
+    if (( DRY_RUN )); then
+        echo -e "   ${C_YELLOW}[dry-run]${C_RESET} POST nodes/${API_NODE}/qemu/${vmid}/template"
+    else
+        local response upid
+        response=$(pve_api POST "nodes/${API_NODE}/qemu/${vmid}/template") || {
+            err "Template conversion failed"; return 1
+        }
+        upid=$(echo "$response" | pve_extract_upid)
+        [[ -z "$upid" ]] || pve_wait_task "$upid" 60 || { err "Template conversion failed"; return 1; }
+        ok "Template sealed"
+    fi
+
+    # Clean up import image from storage
+    if (( ! DRY_RUN )); then
+        pve_api DELETE \
+            "nodes/${API_NODE}/storage/${API_IMPORT_STORAGE}/content/${API_IMPORT_STORAGE}:import/${filename}" \
+            &>/dev/null || true
+    fi
+
+    ok "Template ${C_BOLD}${tpl_name}${C_RESET} (VMID ${vmid}) ready"
+}
+
 # --- Catalog display ----------------------------------------------------------
 list_catalog() {
     if (( IMG_COUNT == 0 )); then
         err "No images discovered."
         exit 1
     fi
-    printf "\n  ${C_BOLD}%-4s  %-16s  %-28s  %s${C_RESET}\n" "#" "KEY" "NAME" "VMID"
-    printf "  %-4s  %-16s  %-28s  %s\n" "---" "----------------" "----------------------------" "----"
+    printf "\n  ${C_BOLD}%-4s  %-38s  %-28s  %s${C_RESET}\n" "#" "TEMPLATE" "NAME" "VMID"
+    printf "  %-4s  %-38s  %-28s  %s\n" "---" "--------------------------------------" "----------------------------" "----"
+    local safe_arch="${ARCH//_/-}"
     for (( i=0; i<IMG_COUNT; i++ )); do
-        printf "  %-4d  %-16s  %-28s  %d\n" \
-            $(( i + 1 )) "${IMG_KEY[$i]}" "${IMG_NAME[$i]}" $(( START_ID + i + 1 ))
+        printf "  %-4d  %-38s  %-28s  %d\n" \
+            $(( i + 1 )) "ci-${IMG_KEY[$i]}-${TIMESTAMP}.${safe_arch}" "${IMG_NAME[$i]}" $(( START_ID + i + 1 ))
     done
     echo
 }
@@ -562,9 +875,20 @@ Options:
   -d, --distro NAME     Filter by family: debian ubuntu rocky opensuse oracle freebsd
       --force           Replace existing templates with same VMID
       --no-customize    Skip virt-customize (guest-agent injection, etc.)
+      --arch ARCH       Target architecture (default: x86_64)
   -n, --dry-run         Show what would be done without making changes
   -h, --help            Show this help message
   -v, --version         Show version
+
+API mode (run remotely against a PVE cluster, requires PVE 8.4+):
+      --api                Enable API mode (all PVE operations via REST API)
+      --api-host URL       PVE API URL (e.g. https://pve.example.com:8006)
+      --api-node NAME      PVE node name (e.g. pve1)
+      --api-token TOKEN    API token: user@realm!tokenid=secret
+      --api-import-storage NAME
+                           Storage for downloading images (default: local)
+                           Must support 'import' content type (directory-backed).
+                           VM disks are stored on --storage as usual.
 
 Examples:
   $(basename "$0") -i                     Interactive selection
@@ -574,6 +898,10 @@ Examples:
   $(basename "$0") -b -S 60G              Resize disks to 60G
   $(basename "$0") -l                     List available images
   $(basename "$0") -n -b                  Dry run, all images
+
+  # API mode (remote):
+  $(basename "$0") --api --api-host https://pve:8006 \\
+      --api-node pve1 --api-token 'user@pam!token=secret' -b -d debian
 EOF
 }
 
@@ -598,6 +926,12 @@ main() {
             --force)           FORCE=1; shift ;;
             --no-customize)    CUSTOMIZE=0; shift ;;
             --dry-run|-n)      DRY_RUN=1; shift ;;
+            --arch)            ARCH="$2"; shift 2 ;;
+            --api)             API_MODE=1; shift ;;
+            --api-host)        API_HOST="$2"; shift 2 ;;
+            --api-node)        API_NODE="$2"; shift 2 ;;
+            --api-token)       API_TOKEN="$2"; shift 2 ;;
+            --api-import-storage) API_IMPORT_STORAGE="$2"; shift 2 ;;
             -*)                err "Unknown option: $1"; usage; exit 1 ;;
             *)                 err "Unexpected argument: $1"; usage; exit 1 ;;
         esac
@@ -616,6 +950,34 @@ main() {
         esac
     fi
 
+    # Validate architecture
+    case "$ARCH" in
+        x86_64) ;;  # Currently the only supported PVE target
+        # Future: aarch64, riscv64, etc. when PVE adds support
+        *) err "Unsupported architecture: $ARCH (currently only x86_64)"; exit 1 ;;
+    esac
+
+    # Validate API mode
+    if (( API_MODE )); then
+        if [[ -z "$API_HOST" || -z "$API_NODE" || -z "$API_TOKEN" ]]; then
+            err "API mode requires --api-host, --api-node, and --api-token"
+            exit 1
+        fi
+        # Strip trailing slash from API host
+        API_HOST="${API_HOST%/}"
+        # Validate token format (user@realm!tokenid=secret)
+        if [[ ! "$API_TOKEN" =~ ^[^@]+@[^!]+![^=]+=.+ ]]; then
+            err "Invalid API token format. Expected: user@realm!tokenid=secret"
+            exit 1
+        fi
+        # Customization is not available in API mode
+        if (( CUSTOMIZE )); then
+            warn "Image customization (virt-customize) not available in API mode"
+            warn "Use cloud-init packages/runcmd directives instead"
+            CUSTOMIZE=0
+        fi
+    fi
+
     # Discovery needs network tools
     check_fetch_deps
 
@@ -630,8 +992,8 @@ main() {
 
     # Import modes need root and PVE tools (dry-run can skip these)
     if (( ! DRY_RUN )); then
-        if [[ $EUID -ne 0 ]]; then
-            err "This script must be run as root."
+        if (( ! API_MODE )) && [[ $EUID -ne 0 ]]; then
+            err "This script must be run as root (or use --api for remote mode)."
             exit 1
         fi
         check_import_deps
@@ -658,7 +1020,11 @@ main() {
     echo
 
     for idx in "${SELECTED[@]}"; do
-        import_single "$idx" || (( ERRORS++ )) || true
+        if (( API_MODE )); then
+            import_single_api "$idx" || (( ERRORS++ )) || true
+        else
+            import_single_local "$idx" || (( ERRORS++ )) || true
+        fi
         echo
     done
 
