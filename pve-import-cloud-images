@@ -64,7 +64,7 @@ MODE=""
 DISTRO_FILTER=""
 MAX_VERSIONS=2
 ARCH="x86_64"
-TIMESTAMP=$(date +%Y%m%d)
+TIMESTAMP=$(date +%Y%m%d%H%M)
 
 # --- API mode -----------------------------------------------------------------
 API_MODE=0
