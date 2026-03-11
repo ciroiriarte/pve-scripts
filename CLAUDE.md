@@ -4,7 +4,7 @@
 - Keep the subject line under 72 characters
 - Use the `Assisted-By:` trailer (not `Generated-By:`) — this repo contains
   human-originated code with AI-assisted improvements
-- Do NOT remove the Co-Authored-By trailer; it is required for transparency
+- Do NOT include `Co-Authored-By` — the `Assisted-By` trailer is sufficient
 - Always include: Signed-off-by: Ciro Iriarte <ciro.iriarte+software@gmail.com>
 
 ## Coding standards
