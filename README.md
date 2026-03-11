@@ -19,7 +19,7 @@ Dynamically scans distribution mirrors to discover the latest releases — no ha
 | Rocky Linux | dl.rockylinux.org | — |
 | openSUSE Leap | download.opensuse.org | ptp_kvm module |
 | Oracle Linux | yum.oracle.com | — |
-| FreeBSD | download.freebsd.org | — |
+| FreeBSD | download.freebsd.org | VM notes with install instructions |
 
 **Usage:**
 
@@ -46,6 +46,40 @@ pve-import-cloud-images --dry-run --batch
 2. Optionally inject `qemu-guest-agent` via `virt-customize`
 3. Create VM with EFI, virtio-scsi, serial console, cloud-init drive
 4. Import disk and convert to template
+
+**FreeBSD guest agent:**
+
+FreeBSD images cannot be customized offline (Linux cannot write to UFS2 filesystems), so `qemu-guest-agent` must be installed after first boot:
+
+```bash
+pkg install -y qemu-guest-agent
+sysrc qemu_guest_agent_enable=YES
+service qemu-guest-agent start
+```
+
+To automate this via cloud-init, create a user-data snippet on a snippets-enabled storage (e.g. `local:snippets/freebsd-agent.yml`):
+
+```yaml
+#cloud-config
+hostname: my-freebsd-vm
+ssh_authorized_keys:
+  - ssh-rsa AAAA... user@host
+users:
+  - default
+packages:
+  - qemu-guest-agent
+runcmd:
+  - sysrc qemu_guest_agent_enable=YES
+  - service qemu-guest-agent start
+```
+
+Then apply it to the VM:
+
+```bash
+qm set <vmid> --cicustom "user=local:snippets/freebsd-agent.yml"
+```
+
+> **Note:** FreeBSD uses `nuageinit` instead of Python cloud-init. It does not read `vendor-data`, so `cicustom user=` is required — which replaces PVE's auto-generated user-data. The snippet must include all cloud-init settings (hostname, SSH keys, users, etc.).
 
 **Dependencies:** `qm`, `qemu-img`, `wget` or `curl`. Optional: `libguestfs-tools` (for guest-agent injection), `xz` (for FreeBSD images).
 

@@ -485,7 +485,15 @@ set_freebsd_agent_notes() {
         "pkg install -y qemu-guest-agent" \
         "sysrc qemu_guest_agent_enable=YES" \
         "service qemu-guest-agent start" \
-        '```')
+        '```' \
+        "" \
+        "To automate via cloud-init, use cicustom with a" \
+        "user-data snippet containing packages and runcmd:" \
+        '```' \
+        "qm set <vmid> --cicustom \"user=local:snippets/freebsd-agent.yml\"" \
+        '```' \
+        "Note: cicustom user= replaces PVE-generated user-data," \
+        "so the snippet must include hostname, SSH keys, etc.")
     if (( API_MODE )); then
         pve_api PUT "nodes/${API_NODE}/qemu/${vmid}/config" \
             "description=${notes}" &>/dev/null || true
