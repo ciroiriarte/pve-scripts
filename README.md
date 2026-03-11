@@ -2,9 +2,9 @@
 
 Operational scripts for [Proxmox VE](https://www.proxmox.com/en/proxmox-virtual-environment) clusters.
 
-## Scripts
+---
 
-### pve-import-cloud-images
+## pve-import-cloud-images
 
 Import upstream cloud images as PVE templates ready for cloning with cloud-init.
 
@@ -141,7 +141,9 @@ API calls.  The only local dependency is `curl`.
 
 **Dependencies (API mode):** `curl` only. No SSH access or local PVE tools required.
 
-### pve-vmnic-fix
+---
+
+## pve-vmnic-fix
 
 Repair VM/CT network bridges after host network changes (e.g. applying pending network config, restarting networking, or SDN reload).
 
@@ -163,6 +165,8 @@ pve-vmnic-fix --all
 # Preview changes
 pve-vmnic-fix --dry-run --all
 ```
+
+---
 
 ## Installation
 
