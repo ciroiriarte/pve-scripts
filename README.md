@@ -16,9 +16,9 @@ Dynamically scans distribution mirrors to discover the latest releases — no ha
 |---|---|---|
 | Debian | cdimage.debian.org | qemu-guest-agent |
 | Ubuntu LTS | cloud-images.ubuntu.com | qemu-guest-agent |
-| Rocky Linux | dl.rockylinux.org | — |
+| Rocky Linux | dl.rockylinux.org | v10 requires x86-64-v3 |
 | openSUSE Leap | download.opensuse.org | ptp_kvm module |
-| Oracle Linux | yum.oracle.com | — |
+| Oracle Linux | yum.oracle.com | v10 requires x86-64-v3 |
 | FreeBSD | download.freebsd.org | VM notes with install instructions |
 
 **Usage:**
@@ -46,6 +46,15 @@ pve-import-cloud-images --dry-run --batch
 2. Optionally inject `qemu-guest-agent` via `virt-customize`
 3. Create VM with EFI, virtio-scsi, serial console, cloud-init drive
 4. Import disk and convert to template
+
+**EL10 / x86-64-v3 requirement:**
+
+Rocky Linux 10 and Oracle Linux 10 (RHEL 10-based) require x86-64-v3 (Haswell or newer). VMs will fail to boot on hosts with older CPUs (e.g. Ivy Bridge, Sandy Bridge). Verify your host supports v3 before importing these images:
+
+```bash
+/lib/ld-linux-x86-64.so.2 --help 2>&1 | grep supported
+# or check for AVX2: grep -q avx2 /proc/cpuinfo && echo v3 || echo v2
+```
 
 **FreeBSD guest agent:**
 
