@@ -275,7 +275,7 @@ discover_freebsd() {
         filename=$(echo "$listing" | extract_hrefs \
             | grep -F "FreeBSD-${ver}-RELEASE-amd64-BASIC-CLOUDINIT-ufs.qcow2.xz" | head -1)
         [[ -n "$filename" ]] || continue
-        echo "freebsd-${ver}|FreeBSD ${ver}|${base}/${ver}-RELEASE/amd64/Latest/${filename}|freebsd|"
+        echo "freebsd-${ver}|FreeBSD ${ver}|${base}/${ver}-RELEASE/amd64/Latest/${filename}|freebsd|guest-agent"
     done
 }
 
@@ -437,7 +437,7 @@ download_image() {
 
 # --- Customize ----------------------------------------------------------------
 customize_image() {
-    local image="$1" action="$2"
+    local image="$1" action="$2" family="$3"
     (( CUSTOMIZE )) || return 0
     [[ -n "$action" ]] || return 0
     case "$action" in
@@ -451,8 +451,14 @@ customize_image() {
             # separate virt-customize operations.
             # /etc/resolv.conf may be a dangling symlink (systemd-resolved),
             # so we force-create it via run-command and clean up afterwards.
-            run virt-customize --network -a "$image" \
-                --run-command 'ip link set eth0 up; ip addr add 169.254.2.15/16 dev eth0; ip route add default via 169.254.2.2; rm -f /etc/resolv.conf; echo nameserver 169.254.2.3 > /etc/resolv.conf; export DEBIAN_FRONTEND=noninteractive; apt-get -q update && apt-get -q -y install qemu-guest-agent || yum -y install qemu-guest-agent || zypper -n install qemu-guest-agent || true; rm -f /etc/resolv.conf'
+            if [[ "$family" == "freebsd" ]]; then
+                # FreeBSD uses ifconfig(8) and pkg(8)
+                run virt-customize --network -a "$image" \
+                    --run-command 'ifconfig vtnet0 inet 169.254.2.15 netmask 255.255.0.0 up; route add default 169.254.2.2; echo nameserver 169.254.2.3 > /etc/resolv.conf; pkg install -y qemu-guest-agent; sysrc qemu_guest_agent_enable=YES; rm -f /etc/resolv.conf'
+            else
+                run virt-customize --network -a "$image" \
+                    --run-command 'ip link set eth0 up; ip addr add 169.254.2.15/16 dev eth0; ip route add default via 169.254.2.2; rm -f /etc/resolv.conf; echo nameserver 169.254.2.3 > /etc/resolv.conf; export DEBIAN_FRONTEND=noninteractive; apt-get -q update && apt-get -q -y install qemu-guest-agent || yum -y install qemu-guest-agent || zypper -n install qemu-guest-agent || true; rm -f /etc/resolv.conf'
+            fi
             ;;
         ptp-fix)
             msg "Enabling ptp_kvm module..."
@@ -520,7 +526,7 @@ import_single_local() {
     fi
 
     # Customize (guest-agent, ptp_kvm, etc.)
-    customize_image "$work_image" "$customize"
+    customize_image "$work_image" "$customize" "${IMG_FAMILY[$idx]}"
 
     # Resize boot disk (optional)
     if [[ -n "$DISK_SIZE" ]]; then
