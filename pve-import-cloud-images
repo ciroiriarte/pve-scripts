@@ -253,6 +253,7 @@ discover_opensuse() {
             fi
         fi
 
+        [[ -n "$url" ]] || continue
         echo "opensuse-${ver}|openSUSE Leap ${ver}|${url}|opensuse|ptp-fix"
         (( found++ )) || true
     done
