@@ -364,7 +364,7 @@ vmid_exists() {
 pve_api() {
     local method="$1" endpoint="$2"
     shift 2
-    local -a curl_args=(-sfk --max-time 30
+    local -a curl_args=(-sk --max-time 30 -w '\n%{http_code}'
         -H "Authorization: PVEAPIToken=${API_TOKEN}")
 
     [[ "$method" != "GET" ]] && curl_args+=(-X "$method")
@@ -373,7 +373,20 @@ pve_api() {
         curl_args+=(--data-urlencode "$arg")
     done
 
-    curl "${curl_args[@]}" "${API_HOST}/api2/json/${endpoint}"
+    local _raw _body _http_code
+    _raw=$(curl "${curl_args[@]}" "${API_HOST}/api2/json/${endpoint}" 2>/dev/null) || {
+        echo "pve_api: ${method} ${endpoint}: network error" >&2
+        return 1
+    }
+    _http_code=$(echo "$_raw" | tail -1)
+    _body=$(echo "$_raw" | sed '$d')
+
+    if [[ "$_http_code" -ge 200 && "$_http_code" -lt 300 ]] 2>/dev/null; then
+        echo "$_body"
+    else
+        echo "pve_api: ${method} ${endpoint}: HTTP ${_http_code} ${_body}" >&2
+        return 1
+    fi
 }
 
 pve_extract_upid() {
@@ -468,6 +481,50 @@ customize_image() {
                 --write /etc/modules-load.d/ptp_kvm.conf:ptp_kvm
             ;;
     esac
+}
+
+# In API mode, use a cloud-init vendor-data snippet to install
+# qemu-guest-agent on first boot.  This is used instead of virt-customize
+# which is only available in local mode.
+#
+# NOTE: The PVE upload API only accepts 'iso' and 'vztmpl' content types;
+# snippet uploads are not supported (Bugzilla #2208).  The snippet file
+# must be pre-created on the storage as a one-time setup step.
+VENDOR_SNIPPET_NAME="ci-qemu-guest-agent-vendor.yaml"
+VENDOR_SNIPPET_VERIFIED=0   # 0=unknown, 1=exists, 2=missing
+
+ensure_agent_vendor_snippet() {
+    local snippet_storage="$1"
+
+    if (( DRY_RUN )); then
+        echo -e "   ${C_YELLOW}[dry-run]${C_RESET} cicustom vendor=${snippet_storage}:snippets/${VENDOR_SNIPPET_NAME}"
+        return 0
+    fi
+
+    # Only check once per run
+    if (( VENDOR_SNIPPET_VERIFIED == 0 )); then
+        local listing
+        listing=$(pve_api GET "nodes/${API_NODE}/storage/${snippet_storage}/content?content=snippets" 2>/dev/null) || listing=""
+
+        if echo "$listing" | grep -q "${VENDOR_SNIPPET_NAME}"; then
+            VENDOR_SNIPPET_VERIFIED=1
+        else
+            VENDOR_SNIPPET_VERIFIED=2
+            warn "Vendor snippet '${VENDOR_SNIPPET_NAME}' not found on ${snippet_storage}"
+            echo -e "   The PVE API does not support snippet uploads."
+            echo -e "   Create it once on the PVE host:"
+            echo -e "   ${C_CYAN}cat > /path/to/${snippet_storage}/snippets/${VENDOR_SNIPPET_NAME} << 'EOF'"
+            echo -e "   #cloud-config"
+            echo -e "   package_update: true"
+            echo -e "   packages:"
+            echo -e "     - qemu-guest-agent"
+            echo -e "   runcmd:"
+            echo -e "     - systemctl enable --now qemu-guest-agent"
+            echo -e "   EOF${C_RESET}"
+        fi
+    fi
+
+    (( VENDOR_SNIPPET_VERIFIED == 1 ))
 }
 
 # Add a VM description/notes with guest-agent install instructions for
@@ -651,6 +708,8 @@ import_single_api() {
     local tpl_name="ci-${key}-${TIMESTAMP}.${safe_arch}"
     local filename
     filename=$(basename "$url")
+    # PVE download-url rejects .img extension; rename to .qcow2 for import
+    [[ "$filename" == *.img ]] && filename="${filename%.img}.qcow2"
 
     msg "Importing ${C_BOLD}${name}${C_RESET} → ${tpl_name} (VMID ${vmid}) [API mode]"
 
@@ -661,8 +720,8 @@ import_single_api() {
         return 0
     fi
 
-    # Warn about skipped customization
-    if [[ -n "$customize" ]]; then
+    # Warn about skipped customization (guest-agent is handled via vendor-data)
+    if [[ -n "$customize" && "$customize" != "guest-agent" ]]; then
         warn "Customization '${customize}' skipped in API mode (use cloud-init instead)"
     fi
 
@@ -810,6 +869,20 @@ import_single_api() {
     else
         pve_api PUT "nodes/${API_NODE}/qemu/${vmid}/config" \
             "boot=order=scsi0" &>/dev/null || true
+    fi
+
+    # Vendor-data snippet for guest-agent (API mode only, Linux distros)
+    if [[ "$customize" == "guest-agent" && "${IMG_FAMILY[$idx]}" != "freebsd" ]]; then
+        if ensure_agent_vendor_snippet "$STORAGE"; then
+            if (( DRY_RUN )); then
+                echo -e "   ${C_YELLOW}[dry-run]${C_RESET} PUT cicustom=vendor=${STORAGE}:snippets/${VENDOR_SNIPPET_NAME}"
+            else
+                pve_api PUT "nodes/${API_NODE}/qemu/${vmid}/config" \
+                    "cicustom=vendor=${STORAGE}:snippets/${VENDOR_SNIPPET_NAME}" &>/dev/null || {
+                    warn "Could not set vendor-data snippet for guest-agent"
+                }
+            fi
+        fi
     fi
 
     # Resize boot disk (optional)
@@ -1028,10 +1101,8 @@ main() {
             err "Invalid API token format. Expected: user@realm!tokenid=secret"
             exit 1
         fi
-        # Customization is not available in API mode
+        # virt-customize not available in API mode; guest-agent uses vendor-data instead
         if (( CUSTOMIZE )); then
-            warn "Image customization (virt-customize) not available in API mode"
-            warn "Use cloud-init packages/runcmd directives instead"
             CUSTOMIZE=0
         fi
     fi

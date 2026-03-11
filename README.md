@@ -90,7 +90,56 @@ qm set <vmid> --cicustom "user=local:snippets/freebsd-agent.yml"
 
 > **Note:** FreeBSD uses `nuageinit` instead of Python cloud-init. It does not read `vendor-data`, so `cicustom user=` is required — which replaces PVE's auto-generated user-data. The snippet must include all cloud-init settings (hostname, SSH keys, users, etc.).
 
-**Dependencies:** `qm`, `qemu-img`, `wget` or `curl`. Optional: `libguestfs-tools` (for guest-agent injection), `xz` (for FreeBSD images).
+**API mode:**
+
+The script can run remotely (no SSH required) using the PVE REST API:
+
+```bash
+pve-import-cloud-images --mode api \
+    --api-host https://pve.example.com:8006 \
+    --api-node pve1 \
+    --api-token 'user@pam!tokenid=secret-uuid' \
+    --batch --storage local-zfs
+```
+
+All VM operations (create, disk import, template conversion) are performed via
+API calls.  The only local dependency is `curl`.
+
+**API mode pre-requirements:**
+
+1. **Create an API token** on the PVE host (Datacenter → Permissions → API Tokens,
+   or via CLI):
+
+   ```bash
+   pveum user token add root@pam cloudimport --privsep 0
+   ```
+
+   The `--privsep 0` flag disables privilege separation so the token inherits
+   the user's permissions.  Copy the displayed token value — it is shown only
+   once.  The token format for `--api-token` is `user@realm!tokenid=secret`.
+
+2. **Create the vendor-data snippet** for automatic guest-agent installation on
+   Linux templates.  The PVE upload API does not support snippets, so this file
+   must be created once directly on the storage:
+
+   ```bash
+   # On the PVE host — adjust the path for your snippets-enabled storage
+   cat > /mnt/pve/YOUR-STORAGE/snippets/ci-qemu-guest-agent-vendor.yaml << 'EOF'
+   #cloud-config
+   package_update: true
+   packages:
+     - qemu-guest-agent
+   runcmd:
+     - systemctl enable --now qemu-guest-agent
+   EOF
+   ```
+
+   If the snippet is missing, the script still creates templates but skips
+   the `cicustom` vendor-data configuration and prints instructions.
+
+**Dependencies (local mode):** `qm`, `qemu-img`, `wget` or `curl`. Optional: `libguestfs-tools` (for guest-agent injection), `xz` (for FreeBSD images).
+
+**Dependencies (API mode):** `curl` only. No SSH access or local PVE tools required.
 
 ### pve-vmnic-fix
 
