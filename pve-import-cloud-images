@@ -20,7 +20,7 @@ set -euo pipefail
 #
 # Reference: https://iriarte.it/datacenter/2025/02/13/PVE-Cloud-Images.html
 
-VERSION="1.1.0"
+VERSION="1.2.0"
 
 # --- Colors (disabled when stdout is not a terminal) --------------------------
 if [[ -t 1 ]]; then
@@ -181,18 +181,34 @@ discover_rocky() {
     versions=$(echo "$page" | extract_hrefs | grep -xE '[0-9]+' | sort -rn | head -"$MAX_VERSIONS")
 
     for ver in $versions; do
-        local listing filename
+        local listing
         listing=$(fetch_page "$base/$ver/images/x86_64/") || continue
-        # Prefer .latest. symlink
+
+        # GenericCloud (no LVM) — plain partitioned disk
+        local filename
         filename=$(echo "$listing" | extract_hrefs \
-            | grep -E "^Rocky-${ver}-GenericCloud-LVM\.latest\.x86_64\.qcow2$" | head -1)
+            | grep -E "^Rocky-${ver}-GenericCloud\.latest\.x86_64\.qcow2$" | head -1)
         if [[ -z "$filename" ]]; then
+            # Match non-LVM builds: exclude filenames containing "-LVM"
             filename=$(echo "$listing" | extract_hrefs \
+                | grep -E "^Rocky-${ver}-GenericCloud-[0-9].*\.x86_64\.qcow2$" \
+                | grep -v '\-LVM' \
+                | sort -V | tail -1)
+        fi
+        [[ -n "$filename" ]] && \
+            echo "rocky-${ver}|Rocky Linux ${ver}|${base}/${ver}/images/x86_64/${filename}|rocky|"
+
+        # GenericCloud-LVM — LVM-based root disk
+        local lvm_filename
+        lvm_filename=$(echo "$listing" | extract_hrefs \
+            | grep -E "^Rocky-${ver}-GenericCloud-LVM\.latest\.x86_64\.qcow2$" | head -1)
+        if [[ -z "$lvm_filename" ]]; then
+            lvm_filename=$(echo "$listing" | extract_hrefs \
                 | grep -E "^Rocky-${ver}-GenericCloud-LVM-.*\.x86_64\.qcow2$" \
                 | sort -V | tail -1)
         fi
-        [[ -n "$filename" ]] || continue
-        echo "rocky-${ver}|Rocky Linux ${ver}|${base}/${ver}/images/x86_64/${filename}|rocky|"
+        [[ -n "$lvm_filename" ]] && \
+            echo "rocky-${ver}-lvm|Rocky Linux ${ver} (LVM)|${base}/${ver}/images/x86_64/${lvm_filename}|rocky|"
     done
 }
 
