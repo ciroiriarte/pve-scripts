@@ -597,7 +597,7 @@ set_freebsd_agent_notes() {
         "To automate via cloud-init, use cicustom with a" \
         "user-data snippet containing packages and runcmd:" \
         '```' \
-        "qm set <vmid> --cicustom \"user=local:snippets/freebsd-agent.yml\"" \
+        "qm set <vmid> --cicustom \"user=${STORAGE}:snippets/freebsd-agent.yml\"" \
         '```' \
         "Note: cicustom user= replaces PVE-generated user-data," \
         "so the snippet must include hostname, SSH keys, etc.")
