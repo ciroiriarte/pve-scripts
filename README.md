@@ -177,12 +177,104 @@ Reports per-interface status and prints a summary:
 
 ---
 
+## pve-create-tshoot-image
+
+Build a [ReaR](https://relax-and-recover.org/) troubleshooting / restore ISO from a PVE cloud-init template.
+
+The ISO boots into a rescue environment pre-loaded with network diagnostic tools. It identifies the physical host via DMI serial number and applies per-host identity (hostname + IP) from a CSV inventory.
+
+**On boot the ISO will:**
+
+1. Read the system serial number → set hostname and management IP from CSV
+2. Bring up **every** physical NIC and start lldpd for neighbour discovery (unconditional — runs even without IP configuration)
+3. (Optional) Configure a bonded VLAN management interface with per-host IP
+4. Present `tcpdump`, `nic-xray` and `lldpcli` for network diagnostics
+5. Offer `rear recover` to deploy the base OS to local disks
+
+The build VM is an intermediate state — host identity files (`machine-id`, SSH host keys, `random-seed`) are wiped so each restored system is unique.
+
+**Supported distributions:**
+
+| Family | Package manager | Extras |
+|---|---|---|
+| Rocky Linux (8, 9) | dnf + EPEL | nic-xray from OBS |
+| Ubuntu LTS (22.04, 24.04) | apt | nic-xray from OBS |
+| openSUSE Leap (15.x) | zypper | nic-xray from OBS |
+
+**Usage:**
+
+```bash
+# Minimal — hostname assignment only
+pve-create-tshoot-image -t 9000 -c hosts.csv
+
+# Full — with bonded VLAN management network
+pve-create-tshoot-image -t 9000 -c hosts.csv \
+    --vlan-id 100 --netmask /24 --gateway 10.0.0.1 --dns 8.8.8.8
+
+# Remote PVE server, build VM on a specific VLAN
+pve-create-tshoot-image -t 9000 -c hosts.csv -S root@192.168.20.5 \
+    --vm-bridge vmbr0 --vm-vlan 200 \
+    --vm-ip 10.0.200.50/24 --vm-gateway 10.0.200.1
+
+# Rescue-only (smaller ISO, no backup)
+pve-create-tshoot-image -t 9000 -c hosts.csv --rescue-only
+```
+
+**CSV file** (host inventory — serial, hostname, bond members, management IP):
+
+```csv
+# serial,hostname,bond_members,ip
+SVR001,web-server-01,eth0:eth1,10.0.0.11
+SVR002,db-server-01,eno1:eno2,10.0.0.12
+SVR003,app-server-01,ens1f0:ens1f1,10.0.0.13
+```
+
+Bond members use `:` as separator to allow for different hardware across servers.
+
+**Target-host network** (CLI parameters, shared across all hosts):
+
+| Parameter | Description | Default |
+|---|---|---|
+| `--bond-mode` | Bonding mode | `802.3ad` |
+| `--vlan-id` | Management VLAN ID | *(no VLAN)* |
+| `--netmask` | Network mask (e.g. `/24`) | *(required with --gateway/--dns)* |
+| `--gateway` | Default gateway | *(required with --netmask/--dns)* |
+| `--dns` | Comma-separated DNS servers | *(required with --netmask/--gateway)* |
+| `--proxy` | HTTP/HTTPS proxy URL | *(optional)* |
+
+Per-host IP and bond members come from the CSV (allowing different hardware per server). The shared parameters above define how the management interface is constructed (bond → VLAN → IP assignment).
+
+**Build-VM network** (used only during image preparation):
+
+| Parameter | Description | Default |
+|---|---|---|
+| `--vm-bridge` | PVE bridge | `vmbr0` |
+| `--vm-vlan` | VLAN tag on the build VM NIC | *(none)* |
+| `--vm-ip` | Build VM IP (`dhcp` or `IP/MASK`) | `dhcp` |
+| `--vm-gateway` | Gateway (required if static) | |
+| `--vm-dns` | DNS (optional for static) | |
+
+**Workflow:**
+
+1. Clone the specified PVE template to a temporary VM (full clone)
+2. Detect the distribution from the disk image (`/etc/os-release`)
+3. Offline customisation via `virt-customize`: add repos, install rear + lldpd + tcpdump + [nic-xray](https://download.opensuse.org/repositories/home:/ciriarte:/network-tools/), inject ReaR config + boot scripts + CSV + network config, wipe host identity
+4. Resize disk (+10G) and configure cloud-init with a temporary SSH key
+5. Start the VM, wait for the guest agent, and SSH in
+6. Run `rear mkbackup` (or `rear mkrescue` with `--rescue-only`)
+7. Copy the ISO to the output directory
+8. Destroy the temporary VM
+
+**Dependencies:** `qm`, `pvesm`, `pvesh`, `virt-customize`, `virt-cat`, `ssh-keygen`, `ssh`, `scp`. The `--server` option only needs `ssh` and `scp` locally.
+
+---
+
 ## Installation
 
 Copy the desired script(s) to a directory in your `PATH` on each PVE node:
 
 ```bash
-cp pve-import-cloud-images pve-vmnic-fix /usr/local/sbin/
+cp pve-import-cloud-images pve-vmnic-fix pve-create-tshoot-image /usr/local/sbin/
 ```
 
 ## License
