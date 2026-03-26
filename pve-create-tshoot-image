@@ -454,80 +454,16 @@ echo ""
 TSHOOT_EOF
 }
 
-# --- Image customisation (offline, via virt-customize) ------------------------
+# --- Offline file injection (via virt-customize) ------------------------------
 
-# Install packages, add repos, and inject all configuration files into the disk
-# image.  The VM must be stopped when this runs.
-customize_image() {
+# Inject configuration files into the disk image.  Lightweight — no package
+# installation, no network access.  The VM must be stopped when this runs.
+inject_files() {
     local disk="$1"
-    local major="${DISTRO_VERSION%%.*}"
 
-    msg "Customising image ($DISTRO_FAMILY $DISTRO_VERSION)..."
+    msg "Injecting configuration files into disk image..."
 
-    local -a vc=( --network -a "$disk" )
-
-    # ---- distro-specific repo + package setup --------------------------------
-    # IMPORTANT: network state (ip, DNS) does NOT persist across separate
-    # virt-customize operations.  Everything that needs network access must
-    # run in a single --run-command / --run script that sets up SLIRP first.
-    # This matches the approach in pve-import-cloud-images.
-
-    # Common SLIRP preamble — sets up networking inside the libguestfs appliance
-    local slirp_setup
-    slirp_setup='ip link set eth0 up 2>/dev/null; ip addr add 169.254.2.15/16 dev eth0 2>/dev/null; ip route add default via 169.254.2.2 2>/dev/null; rm -f /etc/resolv.conf; echo nameserver 169.254.2.3 > /etc/resolv.conf'
-
-    case "$DISTRO_FAMILY" in
-        rocky)
-            # nic-xray from OBS
-            cat > "$TEMP_DIR/nic-xray.repo" <<REPO_EOF
-[home_ciriarte_network-tools]
-name=Network Tools (home:ciriarte:network-tools)
-baseurl=https://download.opensuse.org/repositories/home:/ciriarte:/network-tools/RockyLinux_${major}/
-enabled=1
-gpgcheck=0
-type=rpm-md
-REPO_EOF
-            vc+=( --upload "$TEMP_DIR/nic-xray.repo:/etc/yum.repos.d/nic-xray.repo" )
-            # All network operations in one shot
-            vc+=( --run-command "${slirp_setup}; dnf install -y epel-release && dnf install -y rear lldpd tcpdump nic-xray dmidecode; rm -f /etc/resolv.conf" )
-            ;;
-
-        ubuntu)
-            local ub_repo="https://download.opensuse.org/repositories/home:/ciriarte:/network-tools/Ubuntu_${DISTRO_VERSION}"
-            # Single script: SLIRP setup + repo + all packages
-            cat > "$TEMP_DIR/install-packages.sh" <<UBUNTU_EOF
-#!/bin/bash
-set -e
-# libguestfs SLIRP networking — must be configured in every operation
-${slirp_setup}
-
-export DEBIAN_FRONTEND=noninteractive
-apt-get update -qq
-apt-get install -y -qq curl gnupg
-
-# Add nic-xray OBS repo
-mkdir -p /etc/apt/keyrings
-curl -fsSL "${ub_repo}/Release.key" | gpg --dearmor -o /etc/apt/keyrings/nic-xray.gpg
-echo "deb [signed-by=/etc/apt/keyrings/nic-xray.gpg] ${ub_repo}/ /" \
-    > /etc/apt/sources.list.d/nic-xray.list
-apt-get update -qq
-
-# Install all troubleshooting packages
-apt-get install -y -qq rear lldpd tcpdump nic-xray dmidecode
-
-# Clean up SLIRP resolv.conf
-rm -f /etc/resolv.conf
-UBUNTU_EOF
-            chmod +x "$TEMP_DIR/install-packages.sh"
-            vc+=( --run "$TEMP_DIR/install-packages.sh" )
-            ;;
-
-        opensuse)
-            local suse_repo="https://download.opensuse.org/repositories/home:/ciriarte:/network-tools/openSUSE_Leap_${DISTRO_VERSION}"
-            # All network operations in one shot
-            vc+=( --run-command "${slirp_setup}; zypper addrepo --no-gpgcheck '${suse_repo}/home:ciriarte:network-tools.repo' 2>/dev/null || true; zypper --gpg-auto-import-keys refresh; zypper -n install rear lldpd tcpdump nic-xray dmidecode; rm -f /etc/resolv.conf" )
-            ;;
-    esac
+    local -a vc=( -a "$disk" )
 
     # ---- create target directories -------------------------------------------
     vc+=( --run-command "mkdir -p /etc/tshoot" )
@@ -537,8 +473,8 @@ UBUNTU_EOF
 
     # ---- inject files --------------------------------------------------------
 
-    # CSV (serial,hostname,ip) — in /etc/tshoot (backed up by ReaR) and in the
-    # skel tree (copied into the rescue system at ISO build time)
+    # CSV (serial,hostname,bond_members,ip) — in /etc/tshoot (backed up by
+    # ReaR) and in the skel tree (copied into the rescue system at ISO build)
     vc+=( --upload "$TEMP_DIR/hosts.csv:/etc/tshoot/hosts.csv" )
     vc+=( --upload "$TEMP_DIR/hosts.csv:/usr/share/rear/skel/default/etc/tshoot/hosts.csv" )
 
@@ -555,12 +491,8 @@ UBUNTU_EOF
     # ReaR local.conf
     vc+=( --upload "$TEMP_DIR/rear-local.conf:/etc/rear/local.conf" )
 
-    # ---- enable lldpd --------------------------------------------------------
-    vc+=( --run-command "systemctl enable lldpd 2>/dev/null || true" )
-
     # ---- wipe host identity --------------------------------------------------
     # Each restored system must regenerate unique IDs on first boot.
-    # Pattern follows pve-import-cloud-images (machine-id reset).
     vc+=( --run-command 'truncate -s 0 /etc/machine-id 2>/dev/null || true' )
     vc+=( --run-command 'rm -f /var/lib/dbus/machine-id; ln -sf /etc/machine-id /var/lib/dbus/machine-id 2>/dev/null || true' )
     vc+=( --run-command 'rm -f /etc/ssh/ssh_host_*' )
@@ -569,7 +501,76 @@ UBUNTU_EOF
 
     run virt-customize "${vc[@]}"
 
-    ok "Image customisation complete"
+    ok "File injection complete"
+}
+
+# --- Online package installation (via SSH on the running VM) ------------------
+
+# Install packages inside the running VM via SSH.  Called after cloud-init
+# has grown the filesystem and network is available.
+install_packages() {
+    local major="${DISTRO_VERSION%%.*}"
+
+    msg "Installing packages ($DISTRO_FAMILY $DISTRO_VERSION)..."
+
+    # Wait for cloud-init AND any background package manager to finish.
+    # cloud-init may report "done" while a spawned zypper/apt/dnf is still running.
+    vm_ssh "cloud-init status --wait 2>/dev/null || true; \
+        while pgrep -x 'zypper|dnf|apt-get|dpkg' &>/dev/null; do sleep 5; done" < /dev/null
+
+    case "$DISTRO_FAMILY" in
+        rocky)
+            # Upload nic-xray repo file
+            cat > "$TEMP_DIR/nic-xray.repo" <<REPO_EOF
+[home_ciriarte_network-tools]
+name=Network Tools (home:ciriarte:network-tools)
+baseurl=https://download.opensuse.org/repositories/home:/ciriarte:/network-tools/Rocky_${major}/
+enabled=1
+gpgcheck=0
+type=rpm-md
+REPO_EOF
+            scp -i "$SSH_KEY_FILE" \
+                -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+                "$TEMP_DIR/nic-xray.repo" "root@${VM_IP}:/etc/yum.repos.d/nic-xray.repo" 2>/dev/null
+            vm_ssh "dnf install -y epel-release && dnf install -y rear lldpd tcpdump nic-xray dmidecode efibootmgr genisoimage" < /dev/null || \
+                die "Package installation failed on Rocky"
+            # ReaR 2.6 (EPEL) does not support GRUB2-BLS (default on EL9+)
+            if (( major >= 9 )); then
+                vm_ssh "echo 'BOOTLOADER=GRUB2-EFI' >> /etc/rear/local.conf" < /dev/null
+            fi
+            ;;
+
+        ubuntu)
+            local ub_repo="https://download.opensuse.org/repositories/home:/ciriarte:/network-tools/Ubuntu_${DISTRO_VERSION}"
+            vm_ssh "export DEBIAN_FRONTEND=noninteractive; \
+                apt-get update -qq && \
+                apt-get install -y -qq curl gnupg && \
+                mkdir -p /etc/apt/keyrings && \
+                curl -fsSL '${ub_repo}/Release.key' | gpg --dearmor -o /etc/apt/keyrings/nic-xray.gpg && \
+                echo 'deb [signed-by=/etc/apt/keyrings/nic-xray.gpg] ${ub_repo}/ /' > /etc/apt/sources.list.d/nic-xray.list && \
+                apt-get update -qq && \
+                apt-get install -y -qq rear lldpd tcpdump nic-xray dmidecode efibootmgr genisoimage" < /dev/null || \
+                die "Package installation failed on Ubuntu"
+            ;;
+
+        opensuse)
+            local suse_repo="https://download.opensuse.org/repositories/home:/ciriarte:/network-tools/openSUSE_Leap_${DISTRO_VERSION}"
+            local suse_archiving="https://download.opensuse.org/repositories/Archiving/${DISTRO_VERSION}"
+            # nic-xray from OBS repo, rear from Archiving (installed via URL to
+            # avoid zypper repo metadata issues with OBS repositories)
+            vm_ssh "zypper addrepo --no-gpgcheck '${suse_repo}/' nic-xray || true; \
+                zypper --gpg-auto-import-keys --no-gpg-checks refresh || true; \
+                zypper -n --no-gpg-checks install lldpd tcpdump nic-xray dmidecode efibootmgr xorriso || true; \
+                zypper -n --no-gpg-checks install '${suse_archiving}/x86_64/rear-2.9-archiving.91.1.x86_64.rpm' || \
+                zypper -n --no-gpg-checks install rear" < /dev/null || \
+                warn "Some packages may not have installed cleanly (zypper exit code non-zero)"
+            ;;
+    esac
+
+    # Enable lldpd
+    vm_ssh "systemctl enable lldpd 2>/dev/null || true" < /dev/null
+
+    ok "Package installation complete"
 }
 
 # --- VM helpers ---------------------------------------------------------------
@@ -949,10 +950,10 @@ main() {
     ok "Disk path: $DISK_PATH"
     detect_distro "$DISK_PATH"
 
-    # ==== STEP 4: resize disk BEFORE customisation ============================
-    # Cloud images are very small (2-3 GB).  Package installation + ReaR
-    # workspace need significantly more room.  Resize the block device and
-    # then grow the root partition/filesystem via virt-customize.
+    # ==== STEP 4: resize disk ================================================
+    # Cloud images are very small (1-3 GB).  Package installation + ReaR
+    # workspace need more room.  Resize the block device — cloud-init will
+    # grow the partition and filesystem automatically at first boot.
     msg "Resizing disk (+10G for packages and ReaR workspace)..."
     local first_disk
     first_disk=$(qm config "$TEMP_VMID" \
@@ -960,31 +961,13 @@ main() {
         | grep -v 'cloudinit' \
         | head -1 | cut -d: -f1)
     qm resize "$TEMP_VMID" "$first_disk" +10G
-    # Re-read disk path after resize (might change for some storage backends)
-    DISK_PATH=$(get_disk_path "$TEMP_VMID")
+    ok "Disk resized"
 
-    # Grow the root partition and filesystem inside the image so
-    # virt-customize has space for package installation.
-    msg "Growing root partition and filesystem..."
-    local root_part
-    # Find the partition holding the main ext filesystem (the largest one)
-    root_part=$(virt-filesystems -a "$DISK_PATH" --filesystems -l 2>/dev/null \
-        | awk '/ext[234]/{print $1; exit}')
-    if [[ -n "$root_part" ]]; then
-        # virt-resize requires a pre-created output file of the target size
-        local resized_path="${DISK_PATH}.resized"
-        local disk_size
-        disk_size=$(stat -c %s "$DISK_PATH")
-        truncate -s "$disk_size" "$resized_path"
-        virt-resize --expand "$root_part" "$DISK_PATH" "$resized_path"
-        mv "$resized_path" "$DISK_PATH"
-        ok "Root partition expanded ($root_part)"
-    else
-        warn "Could not identify root partition — skipping filesystem grow"
-    fi
-
-    # ==== STEP 5: offline customisation =======================================
-    customize_image "$DISK_PATH"
+    # ==== STEP 5: inject configuration files (offline, lightweight) ==========
+    # Only file injection here — no package installation (avoids virt-resize
+    # and SLIRP networking complexity).  Packages are installed via SSH after
+    # the VM boots and cloud-init has grown the filesystem.
+    inject_files "$DISK_PATH"
 
     # ==== STEP 6: configure build-VM networking + start VM =====================
     msg "Configuring build-VM networking..."
@@ -1034,7 +1017,7 @@ main() {
     while (( attempts < 12 )); do
         VM_IP=$(get_vm_ip "$TEMP_VMID") && [[ -n "$VM_IP" ]] && break
         sleep 5
-        (( attempts++ ))
+        (( attempts++ )) || true
     done
     [[ -n "$VM_IP" ]] || die "Could not determine VM IP address"
     ok "VM IP: $VM_IP"
@@ -1045,19 +1028,27 @@ main() {
     fi
     ok "SSH connection established"
 
-    # ==== STEP 8: run ReaR ====================================================
+    # ==== STEP 8: install packages via SSH ====================================
+    install_packages
+
+    # ==== STEP 9: run ReaR ====================================================
     local rear_cmd="mkbackup"
     (( RESCUE_ONLY )) && rear_cmd="mkrescue"
 
     msg "Running rear ${rear_cmd} inside VM (timeout: ${REAR_TIMEOUT}s)..."
     msg "This may take several minutes..."
 
-    if ! vm_ssh "rear -v ${rear_cmd}" < /dev/null; then
+    # Locate rear binary — /usr/sbin may not be in the non-login SSH PATH
+    local rear_bin
+    rear_bin=$(vm_ssh "command -v rear 2>/dev/null || find /usr/sbin /usr/bin /sbin /bin -name rear -type f 2>/dev/null | head -1") || true
+    [[ -z "$rear_bin" ]] && die "rear binary not found in VM — package installation may have failed"
+    ok "rear found at: $rear_bin"
+    if ! vm_ssh "${rear_bin} -v ${rear_cmd}" < /dev/null; then
         die "rear ${rear_cmd} failed — check VM ${TEMP_VMID} for details"
     fi
     ok "ReaR build complete"
 
-    # ==== STEP 9: extract ISO =================================================
+    # ==== STEP 10: extract ISO ================================================
     msg "Copying ISO from VM..."
     local remote_iso
     remote_iso=$(vm_ssh "ls -1t /var/lib/rear/output/*.iso 2>/dev/null | head -1") || true
@@ -1078,7 +1069,7 @@ main() {
 
     ok "ISO saved: ${OUTPUT_DIR}/${final_iso}"
 
-    # ==== STEP 10: destroy temp VM (cleanup trap is the safety net) ===========
+    # ==== STEP 11: destroy temp VM (cleanup trap is the safety net) ===========
     msg "Destroying temporary VM ${TEMP_VMID}..."
     qm stop "$TEMP_VMID" --timeout 30 2>/dev/null || true
     sleep 3
