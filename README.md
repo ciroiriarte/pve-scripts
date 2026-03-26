@@ -183,6 +183,15 @@ Build a [ReaR](https://relax-and-recover.org/) troubleshooting / restore ISO fro
 
 The ISO boots into a rescue environment pre-loaded with network diagnostic tools. It identifies the physical host via DMI serial number and applies per-host identity (hostname + IP) from a CSV inventory.
 
+**Modes of operation:**
+
+| Mode | Where to run | ISO destination | Requirements |
+|---|---|---|---|
+| **Local** | Directly on a PVE node (as root) | PVE node filesystem | PVE tools + libguestfs |
+| **Remote** | From a jump host (`-S user@host`) | Jump host filesystem | `ssh` + `scp` only |
+
+In remote mode the script copies itself and the CSV to the PVE node, builds the ISO there, then downloads it back to the jump host.
+
 **On boot the ISO will:**
 
 1. Read the system serial number → set hostname and management IP from CSV
@@ -199,22 +208,23 @@ The build VM is an intermediate state — host identity files (`machine-id`, SSH
 |---|---|---|
 | Rocky Linux (8, 9) | dnf + EPEL | nic-xray from OBS |
 | Ubuntu LTS (22.04, 24.04) | apt | nic-xray from OBS |
-| openSUSE Leap (15.x) | zypper | nic-xray from OBS |
+| openSUSE Leap (15.x, 16.x) | zypper | nic-xray from OBS |
 
 **Usage:**
 
 ```bash
-# Minimal — hostname assignment only
+# Local mode — run on a PVE node, ISO saved to current directory
 pve-create-tshoot-image -t 9000 -c hosts.csv
 
-# Full — with bonded VLAN management network
+# Local mode — ISO to a specific directory
+pve-create-tshoot-image -t 9000 -c hosts.csv -o /var/tmp/iso/
+
+# Remote mode — build on a PVE node, ISO downloaded to jump host
+pve-create-tshoot-image -t 9000 -c hosts.csv -S root@pve1.example.com
+
+# With VLAN management network (either mode)
 pve-create-tshoot-image -t 9000 -c hosts.csv \
     --vlan-id 100 --netmask /24 --gateway 10.0.0.1 --dns 8.8.8.8
-
-# Remote PVE server, build VM on a specific VLAN
-pve-create-tshoot-image -t 9000 -c hosts.csv -S root@192.168.20.5 \
-    --vm-bridge vmbr0 --vm-vlan 200 \
-    --vm-ip 10.0.200.50/24 --vm-gateway 10.0.200.1
 
 # Rescue-only (smaller ISO, no backup)
 pve-create-tshoot-image -t 9000 -c hosts.csv --rescue-only
@@ -258,14 +268,14 @@ Per-host IP and bond members come from the CSV (allowing different hardware per 
 
 1. Clone the specified PVE template to a temporary VM (full clone)
 2. Detect the distribution from the disk image (`/etc/os-release`)
-3. Offline customisation via `virt-customize`: add repos, install rear + lldpd + tcpdump + [nic-xray](https://download.opensuse.org/repositories/home:/ciriarte:/network-tools/), inject ReaR config + boot scripts + CSV + network config, wipe host identity
-4. Resize disk (+10G) and configure cloud-init with a temporary SSH key
-5. Start the VM, wait for the guest agent, and SSH in
-6. Run `rear mkbackup` (or `rear mkrescue` with `--rescue-only`)
-7. Copy the ISO to the output directory
-8. Destroy the temporary VM
+3. Resize disk (+10G), inject config files via `virt-customize`, wipe host identity
+4. Boot the VM (cloud-init grows the filesystem), install packages via SSH
+5. Run `rear mkbackup` (or `rear mkrescue` with `--rescue-only`)
+6. Copy the ISO to the output directory, destroy the temporary VM
 
-**Dependencies:** `qm`, `pvesm`, `pvesh`, `virt-customize`, `virt-cat`, `ssh-keygen`, `ssh`, `scp`. The `--server` option only needs `ssh` and `scp` locally.
+**Dependencies (local mode):** `qm`, `pvesm`, `pvesh`, `virt-customize`, `virt-cat`, `ssh-keygen`, `ssh`, `scp`.
+
+**Dependencies (remote mode):** `ssh` and `scp` only (PVE tools are used on the remote node).
 
 ---
 

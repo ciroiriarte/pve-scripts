@@ -3,6 +3,17 @@
 # pve-create-tshoot-image — Build a ReaR troubleshooting / restore ISO from
 # a Proxmox VE cloud-init template.
 #
+# Two modes of operation:
+#
+#   LOCAL MODE  — run directly on a PVE node (as root).
+#     The ISO is built locally and written to --output (default: $PWD).
+#     Example:  pve-create-tshoot-image -t 9004 -c hosts.csv
+#
+#   REMOTE MODE — run from a jump host, specify the PVE node with -S.
+#     The script copies itself and the CSV to the remote node, re-executes
+#     there, then copies the resulting ISO back to the local --output dir.
+#     Example:  pve-create-tshoot-image -t 9004 -c hosts.csv -S root@pve1
+#
 # The resulting ISO boots into a ReaR rescue environment pre-configured with
 # network troubleshooting tools.  On boot it:
 #
@@ -66,11 +77,11 @@ run() {
 # --- Defaults -----------------------------------------------------------------
 
 DRY_RUN=0
-PVE_SERVER=""                # empty = local; USER@HOST = delegate via SSH
+PVE_SERVER=""                # empty = local mode; USER@HOST = remote mode
 TEMPLATE=""                  # PVE template VMID  (required)
-CSV_FILE=""                  # serial,hostname,ip CSV (required)
+CSV_FILE=""                  # serial,hostname,bond_members,ip CSV (required)
 STORAGE="local-lvm"         # PVE storage for temp VM
-OUTPUT_DIR="."               # where to write the ISO
+OUTPUT_DIR=""                # where to write the ISO (default: $PWD)
 RESCUE_ONLY=0                # 1 = mkrescue (no backup), 0 = mkbackup
 REAR_TIMEOUT=1800            # max seconds for rear build (30 min)
 BOOT_TIMEOUT=180             # max seconds to wait for guest agent
@@ -663,12 +674,13 @@ vm_ssh() {
         "root@${VM_IP}" "$@"
 }
 
-# --- Remote delegation --------------------------------------------------------
+# --- Remote mode (delegation) -------------------------------------------------
 
-# When --server is specified the script copies itself to the PVE host and
-# re-executes there.  The ISO is then downloaded to the local machine.
+# In remote mode (-S user@host), the script copies itself and the CSV to the
+# target PVE node, re-executes in local mode there, then downloads the
+# resulting ISO back to the jump host.
 delegate_to_server() {
-    msg "Delegating to PVE server ${PVE_SERVER}..."
+    msg "Remote mode: delegating to ${PVE_SERVER}..."
 
     [[ -f "$0" ]] || die "--server requires running from a script file, not a pipe"
 
@@ -801,6 +813,16 @@ and nic-xray.  On boot it identifies the physical host by DMI serial
 number, assigns hostname + IP from a CSV, and can restore the base OS
 via  rear recover .
 
+${C_BOLD}Modes of operation:${C_RESET}
+
+  LOCAL   Run directly on a PVE node (as root).  The ISO is written to
+          the output directory on the local filesystem.
+
+  REMOTE  Run from a jump host and specify the target PVE node with -S.
+          The script copies itself and the CSV to the remote node,
+          builds the ISO there, then copies it back to the local output
+          directory.  Only ssh and scp are required on the jump host.
+
 ${C_BOLD}Required:${C_RESET}
   -t, --template VMID      PVE template VMID to use as the base image
   -c, --csv FILE           Host inventory CSV (serial,hostname,bond_members,ip)
@@ -826,8 +848,8 @@ ${C_BOLD}Build-VM network${C_RESET} (used during image preparation):
 
 ${C_BOLD}General:${C_RESET}
   -s, --storage STORE      PVE storage for temp VM          [local-lvm]
-  -o, --output DIR         Output directory for ISO file    [.]
-  -S, --server USER@HOST   Run on a remote PVE server via SSH
+  -o, --output DIR         Output directory for ISO file    [\$PWD]
+  -S, --server USER@HOST   Remote mode — target PVE node
       --rescue-only        Rescue ISO only — no backup (smaller image)
       --rear-timeout SEC   Timeout for rear build           [1800]
       --dry-run            Show actions without executing
@@ -840,23 +862,29 @@ ${C_BOLD}CSV format${C_RESET} (one host per line, # for comments):
   SVR002,db-server-01,eno1:eno2,10.0.0.12
 
 ${C_BOLD}Supported distributions:${C_RESET}
-  Rocky Linux (8, 9)    Ubuntu LTS (22.04, 24.04)    openSUSE Leap (15.x)
+  Rocky Linux (8, 9)    Ubuntu LTS (22.04, 24.04)    openSUSE Leap (15.x, 16.x)
 
 ${C_BOLD}Examples:${C_RESET}
-  # Minimal — troubleshooting ISO with hostname assignment only
+  # Local mode — run on a PVE node, ISO stays in current directory
   $(basename "$0") -t 9000 -c hosts.csv
 
-  # Full — with VLAN management network (bond members come from CSV)
+  # Local mode — ISO to a specific directory
+  $(basename "$0") -t 9000 -c hosts.csv -o /var/tmp/iso/
+
+  # Local mode — with VLAN management network
   $(basename "$0") -t 9000 -c hosts.csv \\
       --vlan-id 100 --netmask /24 --gateway 10.0.0.1 --dns 8.8.8.8
 
-  # Remote PVE server, build VM on a specific VLAN with static IP
+  # Remote mode — build on a PVE node, ISO downloaded to jump host
+  $(basename "$0") -t 9000 -c hosts.csv -S root@pve1.example.com
+
+  # Remote mode — custom VM networking on the PVE node
   $(basename "$0") -t 9000 -c hosts.csv -S root@192.168.20.5 \\
       --vm-bridge vmbr0 --vm-vlan 200 \\
       --vm-ip 10.0.200.50/24 --vm-gateway 10.0.200.1
 
-  # Rescue-only (smaller ISO, no backup)
-  $(basename "$0") -t 9000 -c hosts.csv --rescue-only --dry-run
+  # Rescue-only (smaller ISO, no full backup)
+  $(basename "$0") -t 9000 -c hosts.csv --rescue-only
 EOF
 }
 
@@ -896,9 +924,10 @@ main() {
         esac
     done
 
-    # ---- required arguments --------------------------------------------------
+    # ---- required arguments / defaults ----------------------------------------
     [[ -n "$TEMPLATE" ]] || die "Missing required option: --template VMID"
     [[ -n "$CSV_FILE" ]] || die "Missing required option: --csv FILE"
+    [[ -z "$OUTPUT_DIR" ]] && OUTPUT_DIR="$PWD"
 
     (( DRY_RUN )) && echo -e "\n${C_YELLOW}=== DRY RUN ===${C_RESET}\n"
 
@@ -907,15 +936,16 @@ main() {
     validate_target_network
     validate_vm_network
 
-    # ---- delegate to remote PVE server? --------------------------------------
+    # ---- select mode of operation --------------------------------------------
     if [[ -n "$PVE_SERVER" ]]; then
+        # REMOTE MODE: delegate to the target PVE node
         delegate_to_server
         exit 0
     fi
 
-    # ---- local execution — prerequisites -------------------------------------
+    # LOCAL MODE: run directly on this PVE node
     if [[ $EUID -ne 0 ]]; then
-        die "Must run as root on the PVE host (or use --server to delegate)"
+        die "Local mode requires root on a PVE host (or use -S user@host for remote mode)"
     fi
 
     for cmd in qm pvesm pvesh virt-customize virt-cat ssh-keygen ssh scp; do
