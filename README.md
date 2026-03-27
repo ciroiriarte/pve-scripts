@@ -1,6 +1,14 @@
-# pve-scripts
+# pve-tools
 
 Operational scripts for [Proxmox VE](https://www.proxmox.com/en/proxmox-virtual-environment) clusters.
+
+## Contents
+
+- [pve-import-cloud-images](#pve-import-cloud-images) - Import upstream cloud images as PVE templates
+- [pve-vmnic-fix](#pve-vmnic-fix) - Repair VM/CT network bridges after host network changes
+- [pve-create-tshoot-image](#pve-create-tshoot-image) - Build a ReaR troubleshooting / restore ISO
+- [Installation](#installation)
+- [License](#license)
 
 ---
 
@@ -293,6 +301,12 @@ Copy the desired script(s) to a directory in your `PATH` on each PVE node:
 
 ```bash
 cp pve-import-cloud-images pve-vmnic-fix pve-create-tshoot-image /usr/local/sbin/
+```
+
+Man pages are provided in `man/man8/`. To install them:
+
+```bash
+cp man/man8/*.8 /usr/local/share/man/man8/
 ```
 
 ## License

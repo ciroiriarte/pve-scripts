@@ -1,0 +1,121 @@
+.\" pve-vmnic-fix - Repair VM/CT network bridges after host network changes
+.\" Copyright (c) 2024-2026 Ciro Iriarte
+.\" SPDX-License-Identifier: MIT
+.TH PVE\-VMNIC\-FIX 8 "2026-03-27" "1.0.0" "Proxmox VE Tools"
+.SH NAME
+pve\-vmnic\-fix \- repair VM/CT network bridges after host network changes
+.SH SYNOPSIS
+.B pve\-vmnic\-fix
+.RB [ \-n ]
+.IR VMID | CTID
+.br
+.B pve\-vmnic\-fix
+.RB [ \-n ]
+.BR \-a | \-\-all
+.SH DESCRIPTION
+.B pve\-vmnic\-fix
+repairs network connectivity for running VMs and containers after
+host\-level network changes such as applying a pending network configuration,
+restarting the networking service, or reloading SDN.
+.PP
+It inspects each guest's network interfaces and fixes:
+.IP \(bu 3
+tap/veth interfaces that have lost their bridge master.
+.IP \(bu 3
+Firewall intermediary links
+.RB ( fwbr / fwpr / fwln )
+that are in a DOWN state.
+.IP \(bu 3
+EVPN not learning guest MACs after a bridge reset.
+.PP
+For each network interface the script:
+.IP 1. 4
+Checks whether the tap/veth device is attached to the correct bridge.
+.IP 2. 4
+Re\-attaches it if the bridge master is missing.
+.IP 3. 4
+Brings up any DOWN firewall chain interfaces
+.RB ( fwbr ", " fwpr ", " fwln ).
+.IP 4. 4
+Re\-announces the guest MAC via FDB for EVPN learning.
+.PP
+The script auto\-detects whether a given ID is a VM or a container by
+querying
+.BR qm (1)
+and
+.BR pct (1).
+.SH OPTIONS
+.TP
+.IR VMID | CTID
+Numeric ID of a single VM or container to fix.
+.TP
+.BR \-a ", " \-\-all
+Fix all running VMs and containers on the node.
+.TP
+.BR \-n ", " \-\-dry\-run
+Show what would be done without making any changes.
+.TP
+.BR \-h ", " \-\-help
+Show the built\-in help message and exit.
+.TP
+.BR \-v ", " \-\-version
+Show the version number and exit.
+.SH EXAMPLES
+Fix a single guest:
+.PP
+.RS
+.nf
+pve\-vmnic\-fix 100
+.fi
+.RE
+.PP
+Fix all running VMs and containers:
+.PP
+.RS
+.nf
+pve\-vmnic\-fix \-\-all
+.fi
+.RE
+.PP
+Preview changes without applying them:
+.PP
+.RS
+.nf
+pve\-vmnic\-fix \-\-dry\-run \-\-all
+.fi
+.RE
+.PP
+Sample output:
+.PP
+.RS
+.nf
+:: Fixing vm 100
+   Checking net0 (bridge: vmbr0)...
+   [+] net0 OK
+:: Done. 1 guest(s), 1 interface(s) checked, 0 repaired.
+.fi
+.RE
+.SH EXIT STATUS
+.TP
+.B 0
+Success.
+.TP
+.B 1
+Failure (invalid arguments, guest not found, etc.).
+.SH DEPENDENCIES
+.BR qm (1),
+.BR pct (1),
+.BR ip (8),
+.BR bridge (8).
+.SH SEE ALSO
+.BR qm (1),
+.BR pct (1),
+.BR ip (8),
+.BR bridge (8),
+.BR pve\-import\-cloud\-images (8),
+.BR pve\-create\-tshoot\-image (8)
+.SH AUTHORS
+Ciro Iriarte
+.RI < ciro.iriarte+software@gmail.com >
+.SH LICENSE
+MIT

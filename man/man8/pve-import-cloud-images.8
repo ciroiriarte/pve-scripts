@@ -1,0 +1,296 @@
+.\" pve-import-cloud-images - Import upstream cloud images as PVE templates
+.\" Copyright (c) 2024-2026 Ciro Iriarte
+.\" SPDX-License-Identifier: MIT
+.TH PVE\-IMPORT\-CLOUD\-IMAGES 8 "2026-03-27" "1.3.0" "Proxmox VE Tools"
+.SH NAME
+pve\-import\-cloud\-images \- import upstream cloud images as Proxmox VE templates
+.SH SYNOPSIS
+.B pve\-import\-cloud\-images
+.RB [ \-i | \-b | \-l ]
+.RB [ \-m
+.IR MODE ]
+.RB [ \-s
+.IR STORAGE ]
+.RB [ \-B
+.IR BRIDGE ]
+.RB [ \-f
+.IR FORMAT ]
+.RB [ \-S
+.IR SIZE ]
+.RB [ \-I
+.IR VMID ]
+.RB [ \-d
+.IR DISTRO ]
+.RB [ OPTIONS ]
+.SH DESCRIPTION
+.B pve\-import\-cloud\-images
+dynamically scans distribution mirrors to discover the latest cloud images,
+downloads them, and imports them as Proxmox VE templates ready for cloning
+with cloud-init.
+No URLs are hardcoded; the script probes mirrors at runtime to find the most
+recent releases.
+.PP
+For each image the workflow is:
+.IP 1. 4
+Download the cloud image (cached in
+.IR /var/tmp/pve\-cloud\-images/ ).
+.IP 2. 4
+Probe the image for the precise OS version via
+.BR virt\-cat (1)
+(e.g. Debian\ 12 becomes 12.13).
+.IP 3. 4
+Optionally inject
+.B qemu\-guest\-agent
+via
+.BR virt\-customize (1).
+.IP 4. 4
+Create a VM shell with EFI, virtio\-scsi, serial console, and a cloud\-init
+drive.
+.IP 5. 4
+Import the disk and convert the VM to a template.
+.PP
+The script supports two execution modes:
+.TP
+.B local
+Uses PVE command\-line tools
+.RB ( qm ,
+.BR qemu\-img )
+directly on the node.
+.TP
+.B api
+Uses the PVE REST API via
+.BR curl (1).
+No SSH or local PVE tools are required; suitable for running from a
+jump host.
+Requires PVE\ 8.4 or later.
+.SS Supported distributions
+The last two releases of each family are discovered automatically:
+.TS
+tab(|);
+lb lb lb
+l l l.
+Family|Mirror|Notes
+_
+Debian|cdimage.debian.org|qemu-guest-agent injected
+Ubuntu LTS|cloud-images.ubuntu.com|qemu-guest-agent injected
+Rocky Linux|dl.rockylinux.org|generic and LVM variants
+openSUSE Leap|download.opensuse.org|ptp_kvm module fix
+Oracle Linux|yum.oracle.com|v10 requires x86-64-v3
+FreeBSD|download.freebsd.org|VM notes with install instructions
+.TE
+.SH OPTIONS
+.SS Execution modes
+.TP
+.BR \-i ", " \-\-interactive
+Select images interactively via a menu.
+This is the default when standard input is a terminal.
+.TP
+.BR \-b ", " \-\-batch
+Import all discovered images non-interactively.
+.TP
+.BR \-l ", " \-\-list
+List discovered images and exit.
+Does not require
+.BR \-\-mode .
+.SS Required for import
+.TP
+.BR \-m ", " \-\-mode " " \fIMODE\fR
+Execution mode:
+.B local
+(PVE CLI tools) or
+.B api
+(REST API).
+Required when importing images.
+.SS Storage and network
+.TP
+.BR \-s ", " \-\-storage " " \fINAME\fR
+Target storage for VM disks.
+Default:
+.BR local\-lvm .
+.TP
+.BR \-B ", " \-\-bridge " " \fINAME\fR
+Network bridge for the template VM.
+Default:
+.BR vmbr0 .
+.TP
+.BR \-f ", " \-\-format " " \fIFMT\fR
+Disk format:
+.BR raw " or " qcow2 .
+Default:
+.BR raw .
+.TP
+.BR \-S ", " \-\-disk\-size " " \fISIZE\fR
+Resize the boot disk after import (e.g.
+.BR 60G ).
+Default: keep the original size.
+.TP
+.BR \-I ", " \-\-start\-id " " \fIID\fR
+Starting VM ID for templates.
+Default:
+.BR 9000 .
+.SS Filtering and customization
+.TP
+.BR \-d ", " \-\-distro " " \fINAME\fR
+Restrict import to a single distribution family:
+.BR debian ", " ubuntu ", " rocky ", " opensuse ", " oracle ", or " freebsd .
+.TP
+.B \-\-force
+Replace existing templates that have the same VM\ ID.
+.TP
+.B \-\-no\-customize
+Skip
+.BR virt\-customize (1)
+(guest\-agent injection and related tweaks).
+.TP
+.BI \-\-arch " ARCH"
+Target architecture.
+Default:
+.BR x86_64 .
+.SS API mode options
+.TP
+.BI \-\-api\-host " URL"
+PVE API base URL (e.g.
+.IR https://pve.example.com:8006 ).
+.TP
+.BI \-\-api\-node " NAME"
+PVE node name (e.g.
+.IR pve1 ).
+.TP
+.BI \-\-api\-token " TOKEN"
+API token in the format
+.IR user@realm!tokenid=secret .
+.TP
+.BI \-\-api\-import\-storage " NAME"
+Storage used for downloading images before import.
+Default:
+.BR local .
+.SS General
+.TP
+.BR \-n ", " \-\-dry\-run
+Show what would be done without making any changes.
+.TP
+.BR \-h ", " \-\-help
+Show the built\-in help message and exit.
+.TP
+.BR \-v ", " \-\-version
+Show the version number and exit.
+.SH EXAMPLES
+List available images (no root required):
+.PP
+.RS
+.nf
+pve\-import\-cloud\-images \-\-list
+.fi
+.RE
+.PP
+Interactive selection in local mode:
+.PP
+.RS
+.nf
+pve\-import\-cloud\-images \-\-mode local \-i
+.fi
+.RE
+.PP
+Batch import all images:
+.PP
+.RS
+.nf
+pve\-import\-cloud\-images \-\-mode local \-\-batch
+.fi
+.RE
+.PP
+Import only Debian templates to a specific storage:
+.PP
+.RS
+.nf
+pve\-import\-cloud\-images \-\-mode local \-\-batch \-\-distro debian \e
+    \-\-storage ceph\-pool
+.fi
+.RE
+.PP
+Dry run to preview actions:
+.PP
+.RS
+.nf
+pve\-import\-cloud\-images \-\-mode local \-\-dry\-run \-\-batch
+.fi
+.RE
+.PP
+Remote import via API:
+.PP
+.RS
+.nf
+pve\-import\-cloud\-images \-\-mode api \e
+    \-\-api\-host https://pve.example.com:8006 \e
+    \-\-api\-node pve1 \e
+    \-\-api\-token \(aquser@pam!tokenid=secret\-uuid\(aq \e
+    \-\-batch \-\-storage local\-zfs
+.fi
+.RE
+.SH FILES
+.TP
+.I /var/tmp/pve\-cloud\-images/
+Download cache directory.
+Images are reused across runs to avoid redundant downloads.
+.SH EXIT STATUS
+.TP
+.B 0
+Success.
+.TP
+.B 1
+Failure (missing dependencies, download error, import error, etc.).
+.SH DEPENDENCIES
+.SS Local mode
+.BR qm (1),
+.BR qemu\-img (1),
+.BR wget (1)
+or
+.BR curl (1).
+Optional:
+.BR libguestfs\-tools
+(for guest\-agent injection),
+.BR xz (1)
+(for FreeBSD images).
+.SS API mode
+.BR curl (1)
+only.
+.SH NOTES
+.SS EL10 / x86\-64\-v3 requirement
+Rocky Linux\ 10 and Oracle Linux\ 10 (RHEL\ 10\-based) require x86\-64\-v3
+(Haswell or newer).
+VMs will fail to boot on hosts with older CPUs.
+Verify host support:
+.PP
+.RS
+.nf
+/lib/ld\-linux\-x86\-64.so.2 \-\-help 2>&1 | grep supported
+.fi
+.RE
+.SS FreeBSD guest agent
+FreeBSD images cannot be customized offline (Linux cannot write to UFS2),
+so
+.B qemu\-guest\-agent
+must be installed after first boot.
+See the
+.I README.md
+for cloud\-init snippet examples.
+.SS API token setup
+Create a token on the PVE host:
+.PP
+.RS
+.nf
+pveum user token add root@pam cloudimport \-\-privsep 0
+.fi
+.RE
+.SH SEE ALSO
+.BR qm (1),
+.BR qemu\-img (1),
+.BR virt\-customize (1),
+.BR virt\-cat (1),
+.BR pve\-vmnic\-fix (8),
+.BR pve\-create\-tshoot\-image (8)
+.SH AUTHORS
+Ciro Iriarte
+.RI < ciro.iriarte+software@gmail.com >
+.SH LICENSE
+MIT
