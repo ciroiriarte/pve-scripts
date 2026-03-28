@@ -45,7 +45,7 @@
 #
 # See --help for full usage.
 
-VERSION="1.1.0"
+VERSION="1.2.0"
 
 set -euo pipefail
 
@@ -220,22 +220,44 @@ generate_files() {
         generate_target_network_conf > "$TEMP_DIR/target-network.conf"
     fi
 
-    # ---- ReaR local.conf -----------------------------------------------------
-    generate_rear_conf > "$TEMP_DIR/rear-local.conf"
-
-    # ---- dhclient.conf (rescue system — short DHCP timeout) ------------------
-    generate_dhclient_conf > "$TEMP_DIR/dhclient.conf"
+    # NOTE: ReaR local.conf and dhclient.conf are generated in inject_files()
+    # because they depend on DISTRO_FAMILY which is set by detect_distro()
+    # after generate_files().
 
     # ---- DHCP timeout override (runs before 58-start-dhclient.sh) ------------
-    cat > "$TEMP_DIR/57-set-dhclient-timeout.sh" <<'DHCP_EOF'
-# Patch dhclient timeout for fast-fail when no DHCP server is reachable.
-# Runs before 58-start-dhclient.sh in the ReaR rescue system.
-sed -i 's/^timeout .*/timeout 6;/' /etc/dhclient.conf 2>/dev/null || true
-sed -i 's/^reboot .*/reboot 2;/' /etc/dhclient.conf 2>/dev/null || true
-sed -i 's/^select-timeout .*/select-timeout 0;/' /etc/dhclient.conf 2>/dev/null || true
-sed -i 's/^initial-interval .*/initial-interval 1;/' /etc/dhclient.conf 2>/dev/null || true
+    cat > "$TEMP_DIR/57-set-dhcp-timeout.sh" <<'DHCP_EOF'
+# Fast-fail DHCP for the ReaR rescue system.
+# Runs before 58-start-dhclient.sh in system-setup.d.
+#
+# Two paths:
+#   1. dhclient present → patch /etc/dhclient.conf timeout
+#   2. dhclient absent  → set up systemd-networkd with short DHCP timeout
+
+if command -v dhclient &>/dev/null && [[ -f /etc/dhclient.conf ]]; then
+    # Path 1: patch dhclient.conf
+    sed -i 's/^timeout .*/timeout 6;/' /etc/dhclient.conf 2>/dev/null || true
+    sed -i 's/^reboot .*/reboot 2;/' /etc/dhclient.conf 2>/dev/null || true
+    sed -i 's/^select-timeout .*/select-timeout 0;/' /etc/dhclient.conf 2>/dev/null || true
+    sed -i 's/^initial-interval .*/initial-interval 1;/' /etc/dhclient.conf 2>/dev/null || true
+elif command -v networkctl &>/dev/null; then
+    # Path 2: systemd-networkd DHCP (Ubuntu 24.04+, no dhclient)
+    mkdir -p /run/systemd/network
+    cat > /run/systemd/network/10-dhcp-rescue.network <<'NETD_EOF'
+[Match]
+Name=en* eth* eno* ens*
+
+[Network]
+DHCP=ipv4
+
+[DHCPv4]
+RouteMetric=100
+UseDomains=true
+MaxAttempts=3
+NETD_EOF
+    networkctl reload 2>/dev/null || systemctl restart systemd-networkd 2>/dev/null || true
+fi
 DHCP_EOF
-    chmod 755 "$TEMP_DIR/57-set-dhclient-timeout.sh"
+    chmod 755 "$TEMP_DIR/57-set-dhcp-timeout.sh"
 
     # ---- boot-time setup script (ReaR rescue system-setup.d) -----------------
     generate_tshoot_script > "$TEMP_DIR/90-tshoot-setup.sh"
@@ -277,10 +299,33 @@ generate_rear_conf() {
 
 OUTPUT=ISO
 OUTPUT_URL=file:///var/lib/rear/output/
+EOF
 
-# Use dhclient in the rescue system (timeout is in dhclient.conf, not here).
+    # Ubuntu 24.04+ dropped isc-dhcp-client; use static networking and let
+    # our 57-set-dhcp-timeout.sh handle DHCP via systemd-networkd instead.
+    if [[ "$DISTRO_FAMILY" == "ubuntu" ]]; then
+        local _ubuntu_major="${DISTRO_VERSION%%.*}"
+        if (( _ubuntu_major >= 24 )); then
+            cat <<'EOF'
+
+# Ubuntu 24.04+ has no dhclient — our rescue script handles DHCP via networkd.
+USE_DHCLIENT=no
+USE_STATIC_NETWORKING=y
+EOF
+        else
+            cat <<'EOF'
+
+# Use dhclient in the rescue system (timeout patched by 57-set-dhcp-timeout.sh).
 USE_DHCLIENT=yes
 EOF
+        fi
+    else
+        cat <<'EOF'
+
+# Use dhclient in the rescue system (timeout patched by 57-set-dhcp-timeout.sh).
+USE_DHCLIENT=yes
+EOF
+    fi
 
     if (( RESCUE_ONLY )); then
         cat <<'EOF'
@@ -632,11 +677,27 @@ if [[ -f "$IDENTITY_CONF" ]]; then
 fi
 
 # --- Network configuration ----------------------------------------------------
-# The restored system has the build VM's netplan config which references
+# The restored system has the build VM's network config which references
 # different interface names.  Replace it with a config that matches the
-# actual hardware.
+# actual hardware.  Dispatch to the correct generator for the distro.
 
 NETCFG="/etc/tshoot/target-network.conf"
+DISTRO_CONF="/etc/tshoot/distro.conf"
+
+# Detect distro — prefer build-time metadata, fall back to /etc/os-release
+if [[ -f "$DISTRO_CONF" ]]; then
+    # shellcheck source=/dev/null
+    source "$DISTRO_CONF"
+else
+    . /etc/os-release 2>/dev/null || true
+    case "${ID:-}" in
+        rocky)                DISTRO_FAMILY="rocky"    ;;
+        ubuntu)               DISTRO_FAMILY="ubuntu"   ;;
+        opensuse-leap|opensuse) DISTRO_FAMILY="opensuse" ;;
+        *)                    DISTRO_FAMILY="unknown"  ;;
+    esac
+    DISTRO_VERSION="${VERSION_ID:-}"
+fi
 
 # Discover physical interfaces (have /sys/class/net/*/device)
 declare -a PHYS_IFACES=()
@@ -647,9 +708,6 @@ for dev_link in /sys/class/net/*/device; do
 done
 
 if [[ ${#PHYS_IFACES[@]} -gt 0 ]]; then
-    # Remove stale cloud-init / build-VM netplan configs
-    rm -f /etc/netplan/*.yaml 2>/dev/null
-
     # Load target network params if available
     if [[ -f "$NETCFG" ]]; then
         # shellcheck source=/dev/null
@@ -670,28 +728,7 @@ if [[ ${#PHYS_IFACES[@]} -gt 0 ]]; then
              $1==s{print $4; exit}' "$CSV")
     fi
 
-    # Build netplan YAML
-    NP="/etc/netplan/50-tshoot.yaml"
-    cat > "$NP" <<NPEOF
-# Generated by tshoot-firstboot.sh
-network:
-  version: 2
-  renderer: networkd
-  ethernets:
-NPEOF
-
-    # List all physical interfaces as available (no DHCP, just make them usable)
-    for iface in "${PHYS_IFACES[@]}"; do
-        cat >> "$NP" <<NPEOF
-    ${iface}:
-      dhcp4: false
-      dhcp6: false
-      optional: true
-NPEOF
-    done
-
-    # If we have bond members + network config, create a bond + optional VLAN
-    # First verify all bond members exist on this system
+    # Validate bond members exist on this system
     _bond_valid=true
     if [[ -n "$HOST_BOND_MEMBERS" && -n "${NETMASK:-}" ]]; then
         IFS=':' read -ra _members <<< "$HOST_BOND_MEMBERS"
@@ -704,18 +741,69 @@ NPEOF
             fi
         done
     fi
+    _have_bond=false
+    [[ -n "$HOST_BOND_MEMBERS" && -n "${NETMASK:-}" && "$_bond_valid" == "true" ]] && _have_bond=true
 
-    if [[ -n "$HOST_BOND_MEMBERS" && -n "${NETMASK:-}" && "$_bond_valid" == "true" ]]; then
-        # Convert colon-separated members to YAML list
-        IFS=':' read -ra _members <<< "$HOST_BOND_MEMBERS"
-        _yaml_members=""
-        for m in "${_members[@]}"; do
-            _yaml_members+="        - ${m// /}"$'\n'
-        done
+    # ---- Distro-specific network config generators ---------------------------
 
-        _bond_mode="${BOND_MODE:-802.3ad}"
+    # Determine the network manager in use
+    _net_mgr="unknown"
+    case "$DISTRO_FAMILY" in
+        ubuntu)   _net_mgr="netplan" ;;
+        rocky)    _net_mgr="nm" ;;
+        opensuse)
+            local _suse_major="${DISTRO_VERSION%%.*}"
+            if (( _suse_major >= 16 )) || systemctl is-active --quiet NetworkManager 2>/dev/null; then
+                _net_mgr="nm"
+            else
+                _net_mgr="wicked"
+            fi
+            ;;
+    esac
 
-        cat >> "$NP" <<NPEOF
+    # ---- Clean stale cloud-init / build-VM network configs -------------------
+    case "$_net_mgr" in
+        netplan)
+            rm -f /etc/netplan/*.yaml 2>/dev/null
+            ;;
+        nm)
+            rm -f /etc/NetworkManager/system-connections/*cloud-init* 2>/dev/null
+            rm -f /etc/sysconfig/network-scripts/ifcfg-e* 2>/dev/null
+            ;;
+        wicked)
+            rm -f /etc/sysconfig/network/ifcfg-eth* /etc/sysconfig/network/ifcfg-ens* \
+                  /etc/sysconfig/network/ifcfg-en* 2>/dev/null
+            ;;
+    esac
+
+    # ======================================================================== #
+    # NETPLAN (Ubuntu)                                                         #
+    # ======================================================================== #
+    if [[ "$_net_mgr" == "netplan" ]]; then
+        NP="/etc/netplan/50-tshoot.yaml"
+
+        if [[ "$_have_bond" == "true" ]]; then
+            IFS=':' read -ra _members <<< "$HOST_BOND_MEMBERS"
+            _yaml_members=""
+            for m in "${_members[@]}"; do _yaml_members+="        - ${m// /}"$'\n'; done
+            _bond_mode="${BOND_MODE:-802.3ad}"
+
+            cat > "$NP" <<NPEOF
+# Generated by tshoot-firstboot.sh
+network:
+  version: 2
+  renderer: networkd
+  ethernets:
+NPEOF
+            for iface in "${PHYS_IFACES[@]}"; do
+                cat >> "$NP" <<NPEOF
+    ${iface}:
+      dhcp4: false
+      dhcp6: false
+      optional: true
+NPEOF
+            done
+            cat >> "$NP" <<NPEOF
   bonds:
     bond0:
       interfaces:
@@ -725,12 +813,8 @@ ${_yaml_members}      parameters:
       dhcp4: false
       dhcp6: false
 NPEOF
-
-        # Management interface is bond0 or bond0.VLAN
-        _mgmt="bond0"
-
-        if [[ -n "${VLAN_ID:-}" ]]; then
-            cat >> "$NP" <<NPEOF
+            if [[ -n "${VLAN_ID:-}" ]]; then
+                cat >> "$NP" <<NPEOF
   vlans:
     bond0.${VLAN_ID}:
       id: ${VLAN_ID}
@@ -738,59 +822,247 @@ NPEOF
       addresses:
         - ${HOST_IP}${NETMASK}
 NPEOF
-            _mgmt="bond0.${VLAN_ID}"
-        else
-            # No VLAN — put IP directly on bond0
-            cat >> "$NP" <<NPEOF
+            else
+                cat >> "$NP" <<NPEOF
       addresses:
         - ${HOST_IP}${NETMASK}
 NPEOF
-        fi
-
-        # Gateway and DNS on the management interface — append via sed
-        if [[ -n "${GATEWAY:-}" ]]; then
-            # Add routes to the last interface block
-            cat >> "$NP" <<NPEOF
+            fi
+            [[ -n "${GATEWAY:-}" ]] && cat >> "$NP" <<NPEOF
       routes:
         - to: default
           via: ${GATEWAY}
 NPEOF
-        fi
-
-        if [[ -n "${DNS_SERVERS:-}" ]]; then
-            IFS=',' read -ra _ns <<< "$DNS_SERVERS"
-            _yaml_dns=""
-            for n in "${_ns[@]}"; do _yaml_dns+="          - ${n// /}"$'\n'; done
-            cat >> "$NP" <<NPEOF
+            if [[ -n "${DNS_SERVERS:-}" ]]; then
+                IFS=',' read -ra _ns <<< "$DNS_SERVERS"
+                _yaml_dns=""
+                for n in "${_ns[@]}"; do _yaml_dns+="          - ${n// /}"$'\n'; done
+                cat >> "$NP" <<NPEOF
       nameservers:
         addresses:
 ${_yaml_dns}NPEOF
-        fi
-
-    elif [[ ${#PHYS_IFACES[@]} -gt 0 ]]; then
-        # No valid bond config — enable DHCP on all physical interfaces
-        # so the host gets basic connectivity
-        NP="/etc/netplan/50-tshoot.yaml"
-        cat > "$NP" <<NPEOF
+            fi
+        else
+            # Fallback: DHCP on all physical interfaces
+            cat > "$NP" <<NPEOF
 # Generated by tshoot-firstboot.sh (fallback — no matching bond members)
 network:
   version: 2
   renderer: networkd
   ethernets:
 NPEOF
-        for iface in "${PHYS_IFACES[@]}"; do
-            cat >> "$NP" <<NPEOF
+            for iface in "${PHYS_IFACES[@]}"; do
+                cat >> "$NP" <<NPEOF
     ${iface}:
       dhcp4: true
       dhcp6: false
       optional: true
 NPEOF
-        done
+            done
+        fi
+        chmod 600 "$NP"
+        netplan apply 2>/dev/null || true
+
+    # ======================================================================== #
+    # NETWORKMANAGER (Rocky, openSUSE 16.x)                                    #
+    # ======================================================================== #
+    elif [[ "$_net_mgr" == "nm" ]]; then
+        _conn_dir="/etc/NetworkManager/system-connections"
+        mkdir -p "$_conn_dir"
+
+        if [[ "$_have_bond" == "true" ]]; then
+            _bond_mode="${BOND_MODE:-802.3ad}"
+            # Map bond mode name to NM numeric mode
+            case "$_bond_mode" in
+                802.3ad|4)       _nm_mode="802.3ad" ;;
+                active-backup|1) _nm_mode="active-backup" ;;
+                balance-rr|0)    _nm_mode="balance-rr" ;;
+                balance-xor|2)   _nm_mode="balance-xor" ;;
+                broadcast|3)     _nm_mode="broadcast" ;;
+                balance-tlb|5)   _nm_mode="balance-tlb" ;;
+                balance-alb|6)   _nm_mode="balance-alb" ;;
+                *)               _nm_mode="802.3ad" ;;
+            esac
+
+            # Bond master — no IP on bond0 when VLAN is used
+            if [[ -n "${VLAN_ID:-}" ]]; then
+                cat > "${_conn_dir}/bond0.nmconnection" <<NMEOF
+[connection]
+id=bond0
+type=bond
+interface-name=bond0
+
+[bond]
+mode=${_nm_mode}
+miimon=100
+
+[ipv4]
+method=disabled
+
+[ipv6]
+method=disabled
+NMEOF
+            else
+                # IP directly on bond0
+                _dns_list=""
+                if [[ -n "${DNS_SERVERS:-}" ]]; then
+                    _dns_list=$(echo "$DNS_SERVERS" | tr ',' ';')
+                    _dns_list="${_dns_list};"
+                fi
+                cat > "${_conn_dir}/bond0.nmconnection" <<NMEOF
+[connection]
+id=bond0
+type=bond
+interface-name=bond0
+
+[bond]
+mode=${_nm_mode}
+miimon=100
+
+[ipv4]
+method=manual
+address1=${HOST_IP}${NETMASK},${GATEWAY:-}
+dns=${_dns_list}
+
+[ipv6]
+method=disabled
+NMEOF
+            fi
+
+            # Bond slaves
+            IFS=':' read -ra _members <<< "$HOST_BOND_MEMBERS"
+            for m in "${_members[@]}"; do
+                m=${m// /}
+                cat > "${_conn_dir}/bond0-slave-${m}.nmconnection" <<NMEOF
+[connection]
+id=bond0-slave-${m}
+type=ethernet
+interface-name=${m}
+master=bond0
+slave-type=bond
+NMEOF
+            done
+
+            # VLAN on bond0
+            if [[ -n "${VLAN_ID:-}" ]]; then
+                _dns_list=""
+                if [[ -n "${DNS_SERVERS:-}" ]]; then
+                    _dns_list=$(echo "$DNS_SERVERS" | tr ',' ';')
+                    _dns_list="${_dns_list};"
+                fi
+                cat > "${_conn_dir}/bond0.${VLAN_ID}.nmconnection" <<NMEOF
+[connection]
+id=bond0.${VLAN_ID}
+type=vlan
+interface-name=bond0.${VLAN_ID}
+
+[vlan]
+id=${VLAN_ID}
+parent=bond0
+
+[ipv4]
+method=manual
+address1=${HOST_IP}${NETMASK},${GATEWAY:-}
+dns=${_dns_list}
+
+[ipv6]
+method=disabled
+NMEOF
+            fi
+        else
+            # Fallback: DHCP on all physical interfaces
+            for iface in "${PHYS_IFACES[@]}"; do
+                cat > "${_conn_dir}/tshoot-${iface}.nmconnection" <<NMEOF
+[connection]
+id=tshoot-${iface}
+type=ethernet
+interface-name=${iface}
+
+[ipv4]
+method=auto
+
+[ipv6]
+method=disabled
+NMEOF
+            done
+        fi
+
+        chmod 600 "${_conn_dir}"/*.nmconnection 2>/dev/null
+        nmcli connection reload 2>/dev/null || true
+        systemctl restart NetworkManager 2>/dev/null || true
+
+    # ======================================================================== #
+    # WICKED (openSUSE Leap 15.x)                                             #
+    # ======================================================================== #
+    elif [[ "$_net_mgr" == "wicked" ]]; then
+        _net_dir="/etc/sysconfig/network"
+
+        if [[ "$_have_bond" == "true" ]]; then
+            _bond_mode="${BOND_MODE:-802.3ad}"
+            IFS=':' read -ra _members <<< "$HOST_BOND_MEMBERS"
+
+            # Build BONDING_SLAVEn entries
+            _slave_lines=""
+            _idx=0
+            for m in "${_members[@]}"; do
+                m=${m// /}
+                _slave_lines+="BONDING_SLAVE_${_idx}='${m}'"$'\n'
+                (( _idx++ ))
+                # Create a minimal ifcfg for each slave
+                cat > "${_net_dir}/ifcfg-${m}" <<WEOF
+STARTMODE='auto'
+BOOTPROTO='none'
+WEOF
+            done
+
+            # Bond master
+            cat > "${_net_dir}/ifcfg-bond0" <<WEOF
+STARTMODE='auto'
+BONDING_MASTER='yes'
+BONDING_MODULE_OPTS='mode=${_bond_mode} miimon=100'
+${_slave_lines}BOOTPROTO='none'
+WEOF
+
+            if [[ -n "${VLAN_ID:-}" ]]; then
+                # VLAN on bond0
+                cat > "${_net_dir}/ifcfg-bond0.${VLAN_ID}" <<WEOF
+STARTMODE='auto'
+ETHERDEVICE='bond0'
+VLAN_ID='${VLAN_ID}'
+BOOTPROTO='static'
+IPADDR='${HOST_IP}${NETMASK}'
+WEOF
+                # Default route
+                [[ -n "${GATEWAY:-}" ]] && echo "default ${GATEWAY} - -" > "${_net_dir}/routes"
+            else
+                # IP directly on bond0
+                cat >> "${_net_dir}/ifcfg-bond0" <<WEOF
+IPADDR='${HOST_IP}${NETMASK}'
+WEOF
+                [[ -n "${GATEWAY:-}" ]] && echo "default ${GATEWAY} - -" > "${_net_dir}/routes"
+            fi
+
+            # DNS
+            if [[ -n "${DNS_SERVERS:-}" ]]; then
+                _dns_static=$(echo "$DNS_SERVERS" | tr ',' ' ')
+                sed -i "s/^NETCONFIG_DNS_STATIC_SERVERS=.*/NETCONFIG_DNS_STATIC_SERVERS=\"${_dns_static}\"/" \
+                    "${_net_dir}/config" 2>/dev/null || \
+                    echo "NETCONFIG_DNS_STATIC_SERVERS=\"${_dns_static}\"" >> "${_net_dir}/config"
+            fi
+        else
+            # Fallback: DHCP on all physical interfaces
+            for iface in "${PHYS_IFACES[@]}"; do
+                cat > "${_net_dir}/ifcfg-${iface}" <<WEOF
+STARTMODE='auto'
+BOOTPROTO='dhcp'
+WEOF
+            done
+        fi
+
+        systemctl restart wicked 2>/dev/null || wicked ifup all 2>/dev/null || true
     fi
 
-    chmod 600 "$NP"
-    netplan apply 2>/dev/null || true
-    logger -t tshoot-firstboot "Network configured: ${PHYS_IFACES[*]}"
+    logger -t tshoot-firstboot "Network configured ($_net_mgr): ${PHYS_IFACES[*]}"
 else
     logger -t tshoot-firstboot "No physical interfaces found — skipping network"
 fi
@@ -826,8 +1098,8 @@ generate_linkup_unit() {
     cat <<'LINKUP_EOF'
 [Unit]
 Description=Bring all physical NICs to link-up state (tshoot)
-After=systemd-networkd.service network.target
-Wants=network.target
+After=systemd-networkd.service NetworkManager-wait-online.service wicked.service network-online.target
+Wants=network-online.target
 
 [Service]
 Type=oneshot
@@ -872,6 +1144,18 @@ inject_files() {
 
     msg "Injecting configuration files into disk image..."
 
+    # Generate files that depend on detected distro (DISTRO_FAMILY/VERSION)
+    generate_rear_conf > "$TEMP_DIR/rear-local.conf"
+
+    local _need_dhclient=true
+    if [[ "$DISTRO_FAMILY" == "ubuntu" ]]; then
+        local _ub_major="${DISTRO_VERSION%%.*}"
+        (( _ub_major >= 24 )) && _need_dhclient=false
+    fi
+    if [[ "$_need_dhclient" == "true" ]]; then
+        generate_dhclient_conf > "$TEMP_DIR/dhclient.conf"
+    fi
+
     local -a vc=( -a "$disk" )
 
     # ---- create target directories -------------------------------------------
@@ -887,16 +1171,17 @@ inject_files() {
     vc+=( --upload "$TEMP_DIR/hosts.csv:/etc/tshoot/hosts.csv" )
     vc+=( --upload "$TEMP_DIR/hosts.csv:/usr/share/rear/skel/default/etc/tshoot/hosts.csv" )
 
-    # dhclient.conf with short timeout → system paths (for ReaR to copy) and skel
-    # Ubuntu/Debian: /etc/dhcp/dhclient.conf   RHEL/SUSE: /etc/dhclient.conf
-    vc+=( --run-command "mkdir -p /etc/dhcp" )
-    vc+=( --upload "$TEMP_DIR/dhclient.conf:/etc/dhclient.conf" )
-    vc+=( --upload "$TEMP_DIR/dhclient.conf:/etc/dhcp/dhclient.conf" )
-    vc+=( --upload "$TEMP_DIR/dhclient.conf:/usr/share/rear/skel/default/etc/dhclient.conf" )
+    # dhclient.conf with short timeout (skipped for distros without dhclient)
+    if [[ -f "$TEMP_DIR/dhclient.conf" ]]; then
+        vc+=( --run-command "mkdir -p /etc/dhcp" )
+        vc+=( --upload "$TEMP_DIR/dhclient.conf:/etc/dhclient.conf" )
+        vc+=( --upload "$TEMP_DIR/dhclient.conf:/etc/dhcp/dhclient.conf" )
+        vc+=( --upload "$TEMP_DIR/dhclient.conf:/usr/share/rear/skel/default/etc/dhclient.conf" )
+    fi
 
     # DHCP timeout patch → runs before 58-start-dhclient.sh in rescue system
-    vc+=( --upload "$TEMP_DIR/57-set-dhclient-timeout.sh:/usr/share/rear/skel/default/etc/scripts/system-setup.d/57-set-dhclient-timeout.sh" )
-    vc+=( --chmod "0755:/usr/share/rear/skel/default/etc/scripts/system-setup.d/57-set-dhclient-timeout.sh" )
+    vc+=( --upload "$TEMP_DIR/57-set-dhcp-timeout.sh:/usr/share/rear/skel/default/etc/scripts/system-setup.d/57-set-dhcp-timeout.sh" )
+    vc+=( --chmod "0755:/usr/share/rear/skel/default/etc/scripts/system-setup.d/57-set-dhcp-timeout.sh" )
 
     # Boot-time setup script → rescue system-setup.d
     vc+=( --upload "$TEMP_DIR/90-tshoot-setup.sh:/usr/share/rear/skel/default/etc/scripts/system-setup.d/90-tshoot-setup.sh" )
@@ -918,6 +1203,16 @@ inject_files() {
 
     # Persistent link-up service — brings all physical NICs up every boot
     vc+=( --upload "$TEMP_DIR/tshoot-linkup.service:/etc/systemd/system/tshoot-linkup.service" )
+
+    # Distro metadata for firstboot runtime detection (generated here because
+    # detect_distro() runs after generate_files())
+    cat > "$TEMP_DIR/distro.conf" <<DISTRO_EOF
+# Distro metadata — generated by pve-create-tshoot-image at build time.
+DISTRO_FAMILY=$DISTRO_FAMILY
+DISTRO_VERSION=$DISTRO_VERSION
+DISTRO_EOF
+    vc+=( --upload "$TEMP_DIR/distro.conf:/etc/tshoot/distro.conf" )
+    vc+=( --upload "$TEMP_DIR/distro.conf:/usr/share/rear/skel/default/etc/tshoot/distro.conf" )
 
     # Target-host identity configuration (optional)
     if [[ -f "$TEMP_DIR/target-identity.conf" ]]; then
@@ -1056,9 +1351,16 @@ UBUNTU_EOF
                 local suse_repo="https://download.opensuse.org/repositories/home:/ciriarte:/network-tools/openSUSE_Leap_${DISTRO_VERSION}"
                 local suse_archiving="https://download.opensuse.org/repositories/Archiving/${DISTRO_VERSION}"
                 cat <<SUSE_EOF
+# Wait for DNS to be ready — cloud-init may report done before resolv.conf is usable
+for _dns_try in \$(seq 1 30); do
+    host download.opensuse.org >/dev/null 2>&1 && break
+    getent hosts download.opensuse.org >/dev/null 2>&1 && break
+    echo "Waiting for DNS (\${_dns_try}/30)..."
+    sleep 2
+done
 zypper addrepo --no-gpgcheck "${suse_repo}/" nic-xray 2>/dev/null || true
 zypper --gpg-auto-import-keys --no-gpg-checks refresh 2>/dev/null || true
-zypper -n --no-gpg-checks install lldpd tcpdump nic-xray dmidecode efibootmgr xorriso 2>/dev/null || true
+zypper -n --no-gpg-checks install lldpd tcpdump nic-xray dmidecode efibootmgr xorriso sysvinit-tools 2>/dev/null || true
 zypper -n --no-gpg-checks install "${suse_archiving}/x86_64/rear-2.9-archiving.91.1.x86_64.rpm" 2>/dev/null || zypper -n --no-gpg-checks install rear 2>/dev/null || true
 # Verify critical packages installed — zypper exit codes are unreliable
 command -v rear > /dev/null || { echo "FATAL: rear not installed"; exit 1; }
@@ -1102,10 +1404,7 @@ SUSE_EOF
         err "Package installation failed (exit code: ${install_status:-timeout})"
         err "Last 20 lines from VM install log:"
         vm_exec 10 "tail -20 /var/log/tshoot-install.log 2>/dev/null" >&2 || true
-        case "$DISTRO_FAMILY" in
-            opensuse) warn "Continuing despite install warnings" ;;
-            *)        die "Package installation failed on $DISTRO_FAMILY" ;;
-        esac
+        die "Package installation failed on $DISTRO_FAMILY"
     fi
 
     # Remove build-VM proxy config so it doesn't leak into the ISO
